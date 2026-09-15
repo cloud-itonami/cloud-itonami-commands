@@ -1,0 +1,104 @@
+#!/usr/bin/env kbb
+;; scripts/build_kotoba.cljk — compile the two Kotoba components to wasm32
+;; and put the artifacts, the host that runs them, and their digests under
+;; dist/.
+;;
+;;   kbb --backend sci scripts/build_kotoba.cljk            # build dist/
+;;   kbb --backend sci scripts/build_kotoba.cljk --check    # exit 1 when dist/ is stale
+;;
+;; JVM-free: `amu compile --jvm-free --target wasm32` (amu is the west sibling
+;; kotoba-lang/amu, or $AMU). The fuel budget is compiled in and is per
+;; INSTANCE (the host makes one instance per call; see
+;; src/cloud/itonami/commands/guest.cljk): a full registry scan is ~200
+;; chunk reads plus prefix compares, measured under 1M; 5M leaves room for
+;; `match-count` over every command with several terms.
+;;
+;; `dist/browser-host.mjs` is amu's typed-ABI host, copied next to the
+;; artifacts exactly as cloud-itonami-app does (runtime/load-guest.mjs): the
+;; consumer needs no amu checkout, only this repository.
+;;
+;; Exit codes: 0 built / current; 1 stale (--check); 2 amu missing or a
+;; compile refused (its message is printed).
+(ns build-kotoba
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            [clojure.string :as str]
+            [nbb.core :refer [*file*]]))
+
+(def here (path/resolve (path/dirname *file*) ".."))
+(defn- root [& parts] (apply path/join here parts))
+
+(def fuel "5000000")
+
+(def modules
+  [{:src "src/cloud/itonami/commands.kotoba" :out "commands.wasm"}
+   {:src "src/cloud/itonami/repo_profile.kotoba" :out "repo_profile.wasm"}])
+
+(defn- amu []
+  (or (aget js/process.env "AMU")
+      (let [sibling (path/resolve here ".." ".." "kotoba-lang" "amu" "bin" "amu")]
+        (when (fs/existsSync sibling) sibling))
+      (do (println "REFUSED: amu not found; set AMU=<path to kotoba-lang/amu/bin/amu>")
+          (js/process.exit 2))))
+
+(defn- sha256 [p]
+  (-> (crypto/createHash "sha256") (.update (fs/readFileSync p)) (.digest "hex")))
+
+(defn- amu-sha [amu-path]
+  (let [r (cp/spawnSync "git" #js ["-C" (path/dirname amu-path) "rev-parse" "HEAD"] #js {:encoding "utf8"})]
+    (if (zero? (.-status r)) (str/trim (.-stdout r)) "unknown")))
+
+(defn- compile! [amu-path {:keys [src out]} dist]
+  (let [target (path/join dist out)
+        r (cp/spawnSync amu-path
+                        #js ["compile" (root src) "--jvm-free" "--target" "wasm32"
+                             "--fuel" fuel "--output" target]
+                        #js {:encoding "utf8"})]
+    (when-not (zero? (.-status r))
+      (println "REFUSED: amu compile" src)
+      (println (str (.-stdout r) (.-stderr r)))
+      (js/process.exit 2))
+    (when-not (str/includes? (.-stdout r) ":ok true")
+      (println "REFUSED: amu compile did not answer :ok true for" src)
+      (println (.-stdout r))
+      (js/process.exit 2))
+    target))
+
+(defn- host-source [amu-path]
+  (path/resolve (path/dirname amu-path) ".." "runtime" "browser-host.mjs"))
+
+(defn- build! [dist]
+  (let [amu-path (amu)]
+    (fs/mkdirSync dist #js {:recursive true})
+    (let [outs (mapv #(compile! amu-path % dist) modules)
+          host (path/join dist "browser-host.mjs")]
+      (fs/copyFileSync (host-source amu-path) host)
+      (let [manifest {:format :cloud.itonami.commands/dist-v1
+                      :amu (amu-sha amu-path)
+                      :fuel (js/parseInt fuel 10)
+                      :target :wasm32-kotoba-v1
+                      :artifacts (into {} (map (fn [{:keys [out]}] [out (sha256 (path/join dist out))]) modules))
+                      :host (sha256 host)}]
+        (fs/writeFileSync (path/join dist "manifest.edn") (str (pr-str manifest) "\n"))
+        manifest))))
+
+(let [args (set (drop 3 (js->clj js/process.argv)))
+      dist (root "dist")]
+  (if (contains? args "--check")
+    ;; rebuild into a scratch dir and compare the artifact digests: a
+    ;; provenance file differs per build, the wasm does not
+    (let [scratch (fs/mkdtempSync (path/join (.tmpdir (js/require "node:os")) "commands-dist-"))
+          fresh (build! scratch)
+          current (try (cljs.reader/read-string (fs/readFileSync (path/join dist "manifest.edn") "utf8"))
+                       (catch :default _ nil))]
+      (fs/rmSync scratch #js {:recursive true :force true})
+      (if (and current (= (:artifacts current) (:artifacts fresh)) (= (:host current) (:host fresh)))
+        (println "dist/ is current" (pr-str (:artifacts fresh)))
+        (do (println "STALE: dist/ does not match a fresh build; run scripts/build_kotoba.cljk")
+            (println "  built  " (pr-str (:artifacts fresh)))
+            (println "  current" (pr-str (:artifacts current)))
+            (js/process.exit 1))))
+    (let [m (build! dist)]
+      (println "built dist/" (pr-str (:artifacts m)) "amu" (:amu m)))))

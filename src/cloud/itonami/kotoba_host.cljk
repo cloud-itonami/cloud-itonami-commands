@@ -1,0 +1,144 @@
+(ns cloud.itonami.kotoba-host
+  "The nbb host for this repository's two Kotoba components (dist/*.wasm).
+
+  Mechanism only: load a wasm artifact through amu's typed-ABI host
+  (`dist/browser-host.mjs`, copied there by scripts/build_kotoba.cljk),
+  hand EDN in as text, and turn the document the guest returns back into
+  Clojure data. Every decision -- what a command is, what a profile may
+  say -- is the guest's; nothing here inspects a table.
+
+  ## One instance per process, re-made when it runs dry
+
+  The fuel budget is compiled into the artifact and is per instance
+  (`dist/manifest.edn` `:fuel`, 5,000,000). A registry scan is ~2,700 fuel
+  and the widest search ~15,000 (measured 2026-09-15 by binary search on the
+  compiled budget), so one instance serves a REPL session of ~1,800
+  resolutions. When it does run dry the call is refused BY NAME
+  (`:kotoba-host/fuel-exhausted`) and `load!` makes a fresh instance;
+  instantiation is asynchronous on this host, so the retry is the caller's.
+
+  ## Loading is asynchronous, calls are not
+
+  `instantiateKotoba` is a promise (it hashes the bytes). `load!` resolves
+  once; every call after that is synchronous, which is what the front end's
+  dispatch expects. Calling before `load!` resolved is a refusal by name."
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            [clojure.edn :as edn]
+            [nbb.core :refer [*file*]]))
+
+;; In this repository the artifacts are under dist/; on a consumer's
+;; classpath (nbb.edn :deps, `:paths ["src" "resources" "dist"]`) the same
+;; files sit at the classpath root beside `cloud/`. Both are `../../..` from
+;; this file; the first that carries a manifest wins.
+(def dist-dir
+  (let [root (path/resolve (path/dirname *file*) ".." ".." "..")
+        nested (path/join root "dist")]
+    (if (fs/existsSync (path/join nested "manifest.edn")) nested root)))
+
+(defonce ^:private host-module (atom nil))
+(defonce ^:private instances (atom {}))
+(defonce ^:private modules (atom {}))
+
+(defn manifest []
+  (edn/read-string (fs/readFileSync (path/join dist-dir "manifest.edn") "utf8")))
+
+(defn- host! []
+  (or @host-module
+      (throw (ex-info "kotoba host not loaded; await (load! \"commands.wasm\") first"
+                      {:type :kotoba-host/not-loaded}))))
+
+(defn- instantiate! [artifact]
+  (let [instantiate (.-instantiateKotoba (host!))
+        bytes (get @modules artifact)]
+    (-> (instantiate bytes #js {})
+        (.then (fn [hosted]
+                 (swap! instances assoc artifact hosted)
+                 hosted)))))
+
+(defn load!
+  "Resolve to the instance for `artifact` (\"commands.wasm\" /
+  \"repo_profile.wasm\"), loading the host module and the bytes on first use.
+  The bytes are digest-checked against dist/manifest.edn before anything is
+  instantiated: an artifact that is not the one the manifest names is not
+  loaded."
+  [artifact]
+  (let [wasm (path/join dist-dir artifact)
+        expected (get-in (manifest) [:artifacts artifact])]
+    (when-not (fs/existsSync wasm)
+      (throw (ex-info (str "kotoba artifact missing: " wasm " (run scripts/build_kotoba.cljk)")
+                      {:type :kotoba-host/artifact-missing :path wasm})))
+    (let [bytes (fs/readFileSync wasm)
+          actual (-> (js/require "node:crypto") (.createHash "sha256") (.update bytes) (.digest "hex"))]
+      (when-not (= expected actual)
+        (throw (ex-info (str "kotoba artifact digest mismatch for " artifact)
+                        {:type :kotoba-host/digest-mismatch :expected expected :actual actual})))
+      (swap! modules assoc artifact bytes))
+    (-> (if @host-module
+          (js/Promise.resolve @host-module)
+          (-> (js/import (str "file://" (path/join dist-dir "browser-host.mjs")))
+              (.then (fn [m] (reset! host-module m) m))))
+        (.then (fn [_] (instantiate! artifact))))))
+
+;; ---------------------------------------------------------------------------
+;; documents <-> Clojure
+;; ---------------------------------------------------------------------------
+
+(defn document->clj
+  "A document node (the host's frozen `[tag payload]` arrays) as Clojure data."
+  [node]
+  (let [tag (aget node 0)
+        payload (aget node 1)]
+    (case tag
+      "null" nil
+      "bool" payload
+      "i64" (js/Number payload)
+      "f64" payload
+      "string" payload
+      "keyword" (keyword (subs payload 1))
+      "symbol" (symbol payload)
+      "vector" (mapv document->clj payload)
+      "list" (apply list (map document->clj payload))
+      "set" (set (map document->clj payload))
+      "map" (into {} (map (fn [entry] [(document->clj (aget entry 0)) (document->clj (aget entry 1))]) payload))
+      (throw (ex-info (str "unknown document tag " tag) {:type :kotoba-host/unknown-tag :tag tag})))))
+
+(defn- fuel-exhausted? [e]
+  (let [m (str (or (some-> e .-message) e))]
+    (or (.includes m "fuel") (.includes m "unreachable"))))
+
+(defn call
+  "Call export `name` on `artifact` with `args` (already host values: strings,
+  BigInts, document nodes). A trap is rethrown with the export named; fuel
+  exhaustion by its own name, so the caller can `load!` again."
+  [artifact name & args]
+  (let [hosted (or (get @instances artifact)
+                   (throw (ex-info (str "kotoba artifact not loaded: " artifact)
+                                   {:type :kotoba-host/not-loaded :artifact artifact})))
+        f (aget (.-exports (.-instance hosted)) name)]
+    (when-not f
+      (throw (ex-info (str "kotoba export missing: " name) {:type :kotoba-host/export-missing :name name})))
+    (try (apply f args)
+         (catch :default e
+           (if (fuel-exhausted? e)
+             (throw (ex-info (str "kotoba instance exhausted its fuel during " name
+                                  "; reload the artifact")
+                             {:type :kotoba-host/fuel-exhausted :export name}))
+             (throw (ex-info (str "kotoba export " name " trapped: " (or (some-> e .-message) e))
+                             {:type :kotoba-host/trap :export name :message (str (some-> e .-message))})))))))
+
+(defn read-edn
+  "EDN text as a document node made INSIDE the guest instance (canonical
+  order, trusted by the host), for passing to other exports."
+  [artifact text]
+  (call artifact "read-edn" text))
+
+(defn edn->document
+  "A Clojure value as a document, through the guest's reader. Printed without
+  the `#:ns{…}` namespaced-map shorthand: the reader refuses every dispatch
+  form, and a map of `:profile/id`s would otherwise print as one."
+  [artifact value]
+  (read-edn artifact (binding [*print-namespace-maps* false] (pr-str value))))
+
+(defn call->clj [artifact name & args]
+  (document->clj (apply call artifact name args)))

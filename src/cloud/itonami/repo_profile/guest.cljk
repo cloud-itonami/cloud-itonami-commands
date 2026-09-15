@@ -1,0 +1,43 @@
+(ns cloud.itonami.repo-profile.guest
+  "`cloud.itonami.app.repo-profile`, answered by the Kotoba component
+  (dist/repo_profile.wasm). Same names and values as the oracle namespace.
+
+  The one mechanism that lives here: the guest's EDN reader traps on text it
+  refuses (malformed, tagged, past the 64 KiB string bound), and a trap
+  cannot be caught inside the guest on this backend. `admit` catches it and
+  hands the reader's message to the guest's `unreadable`, which decides what
+  refusal it is."
+  (:require [cloud.itonami.kotoba-host :as host]))
+
+(def artifact "repo_profile.wasm")
+
+(defn load! [] (host/load! artifact))
+
+(defn- ask [name & args] (apply host/call->clj artifact name args))
+(defn- doc [value] (host/edn->document artifact value))
+
+(def schema "cloud.itonami.app.repo-profile.v1")
+(def dir-name ".itonami/profiles")
+(def file-name ".itonami/profile.edn")
+(def cli-config-keys #{:skin})
+
+(defn admit [text]
+  (if (nil? text)
+    ;; the oracle's :repo-profile/absent: no text at all is not a reader failure
+    {:schema schema :accepted? false :reason :repo-profile/absent :message "profile がありません。"}
+    (try (ask "admit" (str text))
+         (catch :default e
+           (let [m (str (or (:message (ex-data e)) (some-> e .-message) e))]
+             (ask "unreadable" m))))))
+
+(defn admit-all [pairs]
+  (reduce (fn [acc [source text]]
+            (let [r (assoc (admit text) :source source)]
+              (if (:accepted? r)
+                (update acc :accepted conj r)
+                (update acc :refused conj r))))
+          {:accepted [] :refused []}
+          pairs))
+
+(defn select [accepted opts]
+  (ask "select" (doc (vec accepted)) (doc (or opts {}))))
