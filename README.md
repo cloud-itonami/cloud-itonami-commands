@@ -74,6 +74,8 @@ process with a compiled-in fuel budget (5,000,000; a registry scan is ~2,700).
 kbb --backend sci scripts/gen_commands_kotoba.cljk            # tables -> commands.kotoba (--check)
 AMU=…/kotoba-lang/amu/bin/amu kbb --backend sci scripts/build_kotoba.cljk   # -> dist/ (--check)
 kbb --backend sci --classpath src scripts/test_kotoba.cljk    # 39 test-* exports, one instance each
+amu test src/cloud/itonami/commands.kotoba --fuel 5000000     # same exports on [:jvm-kir :js :wasm] (amu ≥ ADR 0349)
+amu test src/cloud/itonami/repo_profile.kotoba --fuel 5000000
 kbb --backend sci --classpath "src:test" test/kotoba_parity_nbb.cljk   # 588 checks vs the oracles
 ```
 

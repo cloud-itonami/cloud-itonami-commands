@@ -124,12 +124,14 @@
 (defn- cp-width [cp :i64] :i64
   (cond (< cp 128) 1 (< cp 2048) 2 (< cp 65536) 3 :else 4))
 
-(defn- code-points-from [s :string i :i64 n :i64] :i64
-  (if (>= i (string-length s))
-    n
-    (code-points-from s (+ i (cp-width (string-code-point-at s i))) (+ n 1))))
-
-(defn- code-points [s :string] :i64 (code-points-from s 0 0))
+;; `loop`, not self-recursion: the KIR interpreter target traps
+;; self-recursion past 100 frames (measured 2026-09-15, reported as
+;; `fuel-exhausted` whatever the budget); a brief is up to 2,000 code points.
+(defn- code-points [s :string] :i64
+  (loop [i 0 n 0]
+    (if (>= i (string-length s))
+      n
+      (recur (+ i (cp-width (string-code-point-at s i))) (+ n 1)))))
 
 ;; `pr-str` of a keyword: `:ns/name` -- keyword-name drops the namespace and
 ;; a namespaced keyword's namespace is not readable here, so the printer is

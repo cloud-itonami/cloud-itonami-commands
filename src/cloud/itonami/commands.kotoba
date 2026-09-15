@@ -39,8 +39,15 @@
 ;; - `throw`/`try` lower on the KIR interpreter only (`:backends #{:compiler}`),
 ;;   so every refusal is a value. That one is also the style this language
 ;;   asks for at a boundary and would stay if the backends caught up.
-;; - `string-length` counts code points; the oracle's `count` counts UTF-16
-;;   units. They agree outside the astral plane.
+;; - `string-length` is the UTF-8 byte length (every backend); code points are
+;;   counted by walking. The oracle's `count` counts UTF-16 units. They agree
+;;   outside the astral plane.
+;; - a `:document` collection holds at most 32 items and a document 256 nodes:
+;;   argv, a flag map, a comma list and a request body live inside that; a
+;;   33rd comma-list item or a 33rd flag traps `document-vector-too-large` /
+;;   `document-map-too-large`, which the host adapter reports by name.
+;; - the KIR interpreter target traps self-recursion past 100 frames
+;;   (reported as `fuel-exhausted`); walks that can exceed it are `loop`s.
 
 (ns cloud.itonami.commands
   (:export [main read-edn
@@ -187,18 +194,22 @@
                 (percent-byte (+ 128 (mod (quot cp 64) 64)))
                 (percent-byte (+ 128 (mod cp 64))))))
 
-(defn- encode-from [s :string i :i64 n :i64 acc :string] :string
-  (if (>= i n)
-    acc
-    (let [cp (string-code-point-at s i)]
-      (encode-from s (+ i (cp-width cp)) n
-                   (string-concat acc
-                                  (cond (= cp 32) "+"
-                                        (unreserved? cp) (unreserved-text cp)
-                                        :else (utf8-bytes-percent cp)))))))
-
+;; `loop`/`recur`, not self-recursion: the KIR interpreter target traps
+;; self-recursion past 100 frames (measured 2026-09-15, reported as
+;; `fuel-exhausted` whatever the budget) while wasm and js run it as a loop.
+;; Every walk that can exceed 100 steps -- over the bytes of a value, the
+;; code points of a name, the items of a comma list -- is a `loop` here.
 (defn url-encode [s :string] :string
-  (encode-from s 0 (string-length s) ""))
+  (let [n (string-length s)]
+    (loop [i 0 acc ""]
+      (if (>= i n)
+        acc
+        (let [cp (string-code-point-at s i)]
+          (recur (+ i (cp-width cp))
+                 (string-concat acc
+                                (cond (= cp 32) "+"
+                                      (unreserved? cp) (unreserved-text cp)
+                                      :else (utf8-bytes-percent cp)))))))))
 
 ;; a document value as the text url-encode takes: strings as they are, a bare
 ;; flag (`true`) as "true", numbers as digits — what `(str value)` did.
@@ -624,50 +635,58 @@
 (defn- space-byte? [cp :i64] :bool (<= cp 32))
 
 ;; byte offset of the first non-space code point at or after `i`
-(defn- left-edge [s :string i :i64] :i64
-  (if (>= i (string-length s))
-    i
-    (let [cp (string-code-point-at s i)]
-      (if (space-byte? cp) (left-edge s (+ i (cp-width cp))) i))))
+(defn- left-edge [s :string] :i64
+  (loop [i 0]
+    (if (>= i (string-length s))
+      i
+      (let [cp (string-code-point-at s i)]
+        (if (space-byte? cp) (recur (+ i (cp-width cp))) i)))))
 
-;; byte offset just past the last non-space code point, scanning forward
-(defn- right-edge [s :string i :i64 last-end :i64] :i64
-  (if (>= i (string-length s))
-    last-end
-    (let [cp (string-code-point-at s i)
-          next (+ i (cp-width cp))]
-      (right-edge s next (if (space-byte? cp) last-end next)))))
+;; byte offset just past the last non-space code point, scanning forward from `a`
+(defn- right-edge [s :string a :i64] :i64
+  (loop [i a last-end a]
+    (if (>= i (string-length s))
+      last-end
+      (let [cp (string-code-point-at s i)
+            next (+ i (cp-width cp))]
+        (recur next (if (space-byte? cp) last-end next))))))
 
 (defn- trim [s :string] :string
   ;; ASCII whitespace at both ends, which is what the comma-list parse trimmed.
-  (let [a (left-edge s 0)
-        b (right-edge s a a)]
-    (string-substring s a b)))
+  (let [a (left-edge s)]
+    (string-substring s a (right-edge s a))))
 
 ;; `string-index-of` is not qualified on wasm32 (measured 2026-09-15), so the
 ;; comma is found by code point.
-(defn- index-of-cp [s :string cp :i64 i :i64] :i64
-  (if (>= i (string-length s))
-    -1
-    (let [here (string-code-point-at s i)]
-      (if (= cp here) i (index-of-cp s cp (+ i (cp-width here)))))))
+(defn- index-of-cp [s :string cp :i64 from :i64] :i64
+  (loop [i from]
+    (if (>= i (string-length s))
+      -1
+      (let [here (string-code-point-at s i)]
+        (if (= cp here) i (recur (+ i (cp-width here))))))))
 
-(defn- comma-list-from [s :string acc :document] :document
-  (let [i (index-of-cp s 44 0)]
-    (if (< i 0)
-      (let [t (trim s)]
-        (if (blank? t) acc (document-vector-conj acc (document-string t))))
-      (let [t (trim (string-substring s 0 i))]
-        (comma-list-from (string-substring s (+ i 1) (string-length s))
-                         (if (blank? t) acc (document-vector-conj acc (document-string t))))))))
+(defn- conj-trimmed [acc :document piece :string] :document
+  (let [t (trim piece)]
+    (if (blank? t) acc (document-vector-conj acc (document-string t)))))
 
-(defn- digits-from [s :string i :i64 acc :i64] :i64
-  (if (>= i (string-length s))
-    acc
-    (let [cp (string-code-point-at s i)]
-      (if (and (>= cp 48) (<= cp 57))
-        (digits-from s (+ i 1) (+ (* acc 10) (- cp 48)))
-        -1))))   ; a non-digit code point ends the parse; its width does not matter
+;; "a,b" -> ["a" "b"], trimmed, blanks dropped
+(defn- comma-list [s :string] :document
+  (loop [rest s acc (document-vector)]
+    (let [i (index-of-cp rest 44 0)]
+      (if (< i 0)
+        (conj-trimmed acc rest)
+        (recur (string-substring rest (+ i 1) (string-length rest))
+               (conj-trimmed acc (string-substring rest 0 i)))))))
+
+(defn- digits-from [s :string from :i64] :i64
+  ;; the digits from byte `from` as a number, or -1 at the first non-digit
+  (loop [i from acc 0]
+    (if (>= i (string-length s))
+      acc
+      (let [cp (string-code-point-at s i)]
+        (if (and (>= cp 48) (<= cp 57))
+          (recur (+ i 1) (+ (* acc 10) (- cp 48)))
+          -1)))))
 
 ;; `parse-long` on a string of digits with an optional leading `-`; anything
 ;; else is null, as `parse-long` returned nil.
@@ -675,8 +694,8 @@
   (if (blank? s)
     (document-null)
     (if (= 45 (string-code-point-at s 0))
-      (let [n (digits-from s 1 0)] (if (< n 0) (document-null) (document-i64 (- 0 n))))
-      (let [n (digits-from s 0 0)] (if (< n 0) (document-null) (document-i64 n))))))
+      (let [n (digits-from s 1)] (if (< n 0) (document-null) (document-i64 (- 0 n))))
+      (let [n (digits-from s 0)] (if (< n 0) (document-null) (document-i64 n))))))
 
 (defn- boolish? [raw :document] :bool
   (cond
@@ -694,7 +713,7 @@
     (= parse :none) raw
     (= parse :long) (parse-long-doc (value-text raw))
     (= parse :comma-list) (if (= :string (document-kind raw))
-                            (comma-list-from (str-or raw "") (document-vector))
+                            (comma-list (str-or raw ""))
                             (document-null))
     (= parse :boolish) (document-bool (boolish? raw))
     (= parse :file-contents)
@@ -924,7 +943,11 @@
        (string=? (url-encode "日本") "%E6%97%A5%E6%9C%AC")))
 
 (defn test-comma-list [] :bool
-  (= 2 (document-count (comma-list-from " a ,, b" (document-vector)))))
+  (and (= 2 (document-count (comma-list " a ,, b")))
+       ;; 32 items is the document vector bound (a 33rd traps
+       ;; `document-vector-too-large`); the walk itself is a loop, so the
+       ;; interpreter's recursion cliff is not what decides this
+       (= 32 (document-count (comma-list (loop [i 0 acc ""] (if (>= i 32) acc (recur (+ i 1) (string-concat acc "x,")))))))))
 
 (defn test-boolish [] :bool
   (and (boolish? (document-string "yes")) (not (boolish? (document-string "no"))) (boolish? (document-bool true))))
