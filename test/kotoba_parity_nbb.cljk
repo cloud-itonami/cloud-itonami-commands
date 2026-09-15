@@ -1,0 +1,248 @@
+;; The Kotoba components against their Clojure oracles, on a corpus.
+;;
+;;     kbb --backend sci --classpath "src:test" test/kotoba_parity_nbb.cljk
+;;
+;;   0  every case agrees      1  a case disagrees      2  could not measure
+;;
+;; This is the consumer-cutover gate (ADR-q9-whole-component-build-migration:
+;; oracle parity over the whole public surface before any consumer moves).
+;; The oracle is `cloud.itonami.app.commands` / `.repo-profile` (.cljk); the
+;; candidate is dist/*.wasm through `cloud.itonami.commands.guest` /
+;; `cloud.itonami.repo-profile.guest`. Both are asked the same question and
+;; the answers are compared as data.
+;;
+;; Where the two are allowed to differ, and why -- each is a rule below, not a
+;; case-by-case excuse:
+;;
+;;   - a `:command` document is the PROJECTION the front end reads (no :gate,
+;;     :route, :note, and a registry param is {:name}); the oracle's full map
+;;     is projected before comparing.
+;;   - a refusal's `:message` is for a person; `:reason` / `:type` and every
+;;     data key are compared, the message is not.
+;;   - key ORDER: the guest's maps are canonical (keys sorted), so a query
+;;     string and `:refused-keys` are compared as sets of pairs / keys.
+;;   - the oracle throws where the guest returns `{:error …}`; the guest
+;;     adapter re-throws, so both sides are caught the same way here.
+(ns kotoba-parity-nbb
+  (:require [clojure.set :as set]
+            [cloud.itonami.app.commands :as oracle]
+            [cloud.itonami.app.repo-profile :as oracle-rp]
+            [cloud.itonami.commands.guest :as guest]
+            [cloud.itonami.repo-profile.guest :as guest-rp]
+            [cloud.itonami.kotoba-host :as host]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            [nbb.core :refer [*file*]]))
+
+(def root (path/resolve (path/dirname *file*) ".."))
+
+;; the oracle reads its tables the way the front end hands them in
+(oracle/install-sources!
+ (into {} (map (fn [n] [n (fs/readFileSync (path/join root "resources" n) "utf8")]))
+       [oracle/resource-name oracle/alias-resource-name]))
+
+(def failed (atom 0))
+(def checked (atom 0))
+
+(defn- check! [label ok? & [detail]]
+  (swap! checked inc)
+  (if ok?
+    nil
+    (do (swap! failed inc)
+        (println "FAIL" label)
+        (when detail (println "     " (pr-str detail))))))
+
+(defn- outcome
+  "What a call answers: `[:value v]` or `[:throw {:type … data}]`."
+  [f]
+  (try [:value (f)]
+       (catch :default e [:throw (assoc (ex-data e) :message (ex-message e))])))
+
+(defn- project-command [c]
+  (cond
+    (nil? c) nil
+    (:why c) (select-keys c [:command :why])
+    (:body c) (select-keys c [:command :method :template :params :body :requires-one-of :timeout-seconds :stores-token?])
+    (contains? c :gate) (-> (select-keys c [:command :method :template :flags])
+                            (assoc :params (mapv #(select-keys % [:name]) (:params c))))
+    :else (select-keys c [:command :method :template :params :body :requires-one-of :timeout-seconds :stores-token?])))
+
+(defn- query-pairs [path]
+  (let [[base q] (let [i (.indexOf path "?")] (if (neg? i) [path nil] [(subs path 0 i) (subs path (inc i))]))]
+    [base (when q (set (.split q "&")))]))
+
+(defn- same-outcome? [[ka va] [kb vb]]
+  (and (= ka kb)
+       (if (= ka :throw)
+         (= (dissoc va :message) (dissoc vb :message))
+         (= va vb))))
+
+;; ---------------------------------------------------------------------------
+;; commands corpus
+;; ---------------------------------------------------------------------------
+
+(def argv-corpus
+  [["bots" "list"]
+   ["bots" "task" "--id" "b 1" "--text" "hi"]
+   ["bots" "task" "--text" "hi"]
+   ["bots" "hygiene"]
+   ["bots" "refactor" "scan" "--root" "/x"]
+   ["business" "list"]
+   ["business" "create" "--name" "N"]
+   ["auth" "login" "--label" "claude-code"]
+   ["auth" "status"]
+   ["session" "--project" "p 1" "--context-set" "c"]
+   ["workspace" "drive" "documents"]
+   ["workspace" "drive" "documents" "rename" "doc-1" "--title" "New"]
+   ["esign" "envelopes" "show" "env-1"]
+   ["esign" "envelopes" "show" "--envelope" "env-2"]
+   ["agent-bots" "name" "--agent-bot" "ab" "--name" "x" "--dry"]
+   ["no" "such" "thing"]
+   []
+   ["--json"]
+   ["credentials"]
+   ["credentials" "--json"]
+   ["tenant" "connect" "--provider" "github"]
+   ["itonami" "run" "--profile" "p" "--text" "日本語 テキスト"]
+   ["session" "--project" "a*b~c!d(e)f'g.h-i_j/k?l=m&n"]
+   ["projects" "create" "--project" "finance" "--title" "Finance"]
+   ["mail" "projects" "apply"]
+   ["bots" "task" "--id" "b1" "--text" "hi" "--prompt-file" "p.txt"]])
+
+(def opts {:read-file (fn [p] (str "FILE:" p))
+           :enrollment-key (fn [] "ENROLL")})
+
+(defn- registry-arguments
+  "What run-registry! in cloud-itonami-cli hands `request`: named path
+  parameters, then positional ones, then every other flag under its own name."
+  [command rest flags]
+  (let [by-name (into {} (keep (fn [{:keys [name]}]
+                                 (when-let [v (get flags (keyword name))] [name v])))
+                      (:params command))
+        positional (into {} (map vector (remove by-name (map :name (:params command))) rest))
+        payload (into {} (keep (fn [[k v]] (let [n (name k)] (when-not (contains? by-name n) [n v])))) flags)]
+    (merge payload by-name positional)))
+
+(defn- compare-request [label o g]
+  ;; requests: same method/body, same path, query compared as a set of pairs
+  (check! (str label " request outcome kind") (= (first o) (first g)) [o g])
+  (when (= :value (first o) (first g))
+    (let [[ob og] [(second o) (second g)]]
+      (check! (str label " request method/body") (= (dissoc ob :path) (dissoc og :path)) [ob og])
+      (check! (str label " request path") (= (query-pairs (:path ob)) (query-pairs (:path og))) [(:path ob) (:path og)])))
+  (when (= :throw (first o) (first g))
+    (check! (str label " request throw") (= (dissoc (second o) :message) (dissoc (second g) :message)) [o g])))
+
+(defn- run-commands-corpus! []
+  (check! "counts" (= (oracle/counts) (guest/counts)) [(oracle/counts) (guest/counts)])
+  (check! "all count" (= (count (oracle/all)) (count (guest/all))))
+  (check! "all projected" (= (mapv project-command (oracle/all)) (guest/all)))
+  (check! "alias-commands projected" (= (mapv project-command (oracle/alias-commands)) (guest/alias-commands)))
+  (check! "host-side projected" (= (mapv project-command (oracle/host-side-commands)) (guest/host-side-commands)))
+  (doseq [c (oracle/all)]
+    (check! (str "usage " (oracle/command-name c)) (= (oracle/usage c) (guest/usage (project-command c))))
+    (check! (str "command-name " (oracle/command-name c)) (= (oracle/command-name c) (guest/command-name (project-command c)))))
+  (doseq [terms [[] ["bots"] ["BOTS" "list"] ["workspace" "drive"] ["zzz"] [" "]]]
+    (check! (str "matching " (pr-str terms))
+            (= (mapv project-command (oracle/matching terms)) (guest/matching terms))
+            [(count (oracle/matching terms)) (count (guest/matching terms))]))
+  (doseq [argv argv-corpus]
+    (let [label (pr-str argv)]
+      (check! (str label " words") (= (oracle/words argv) (guest/words argv)) [(oracle/words argv) (guest/words argv)])
+      (check! (str label " parse-flags") (= (oracle/parse-flags argv) (guest/parse-flags argv)))
+      (let [o (oracle/resolve-invocation argv)
+            g (guest/resolve-invocation argv)]
+        (check! (str label " resolve-invocation")
+                (= (cond-> o (contains? o :command) (update :command project-command)) g)
+                [(cond-> o (contains? o :command) (update :command project-command)) g])
+        (case (:kind o)
+          :registry
+          (let [args (registry-arguments (:command o) (:rest o) (:flags o))]
+            (compare-request label
+                             (outcome #(oracle/request (:command o) args nil))
+                             (outcome #(guest/request (:command g) args nil))))
+          :alias
+          (let [o-r (outcome #(oracle/alias-request (:command o) (:flags o) opts))
+                g-r (outcome #(guest/alias-request (:command g) (:flags g) opts))]
+            (check! (str label " alias-request") (same-outcome? o-r g-r) [o-r g-r]))
+          nil))))
+  ;; both refusals of the effect a host does not supply
+  (let [a (:command (oracle/resolve-invocation ["bots" "task" "--id" "b" "--text" "t" "--prompt-file" "p"]))
+        o (outcome #(oracle/alias-request a {:id "b" :text "t" :prompt-file "p"} {}))
+        g (outcome #(guest/alias-request (project-command a) {:id "b" :text "t" :prompt-file "p"} {}))]
+    (check! "alias-request without :read-file refuses the same way" (same-outcome? o g) [o g])))
+
+;; ---------------------------------------------------------------------------
+;; repo-profile corpus
+;; ---------------------------------------------------------------------------
+
+(def ok "{:profile/schema \"cloud.itonami.app.repo-profile.v1\" :profile/id \"jun\"")
+
+(def profile-corpus
+  [(str ok "}")
+   (str ok " :bot/name \"Jun\" :bot/brief \"b\" :bot/model-preference \"m\" :cli/config {:skin \"dark\"}}")
+   (str ok " :server {:port 1}}")
+   (str ok " :cli/config {:skin \"dark\" :server {}}}")
+   (str ok " :cli/config 3}")
+   "{:profile/schema \"v0\" :profile/id \"jun\"}"
+   "{:profile/schema \"cloud.itonami.app.repo-profile.v1\"}"
+   "{:profile/schema \"cloud.itonami.app.repo-profile.v1\" :profile/id \" \"}"
+   (str ok " :bot/name \"\"}")
+   (str ok " :bot/name \"" (apply str (repeat 61 "a")) "\"}")
+   (str ok " :bot/name \"" (apply str (repeat 60 "あ")) "\"}")
+   (str ok " :bot/name \"" (apply str (repeat 61 "あ")) "\"}")
+   (str ok " :bot/brief \"" (apply str (repeat 2001 "b")) "\"}")
+   (str ok " :bot/brief 12345}")
+   "[1 2 3]"
+   "{:a"
+   "{:a #inst \"2020-01-01\"}"
+   "{:a #uuid \"00000000-0000-0000-0000-000000000000\"}"
+   "#foo {}"
+   nil
+   (str ok " :profile/for \"jun\" :profile/default? true :bot/context-refs [\"a\" \"b\"] :bot/tools-requested [:x]}")
+   (str ok " :unknown/one 1 :unknown/two 2}")])
+
+(defn- normalize-admit [r]
+  (cond-> (dissoc r :message)
+    (:refused-keys r) (update :refused-keys set)))
+
+(defn- run-profile-corpus! []
+  (doseq [text profile-corpus]
+    (let [label (str "admit " (pr-str (some-> text (subs 0 (min 60 (count text))))))
+          o (normalize-admit (oracle-rp/admit text))
+          g (normalize-admit (guest-rp/admit text))]
+      (check! label (= o g) [o g])))
+  (let [texts [["a.edn" (str ok "}")]
+               ["b.edn" "{:x 1}"]
+               ["c.edn" (str ok " :profile/id \"ken\" :profile/for \"ken\"}")]]
+        o (oracle-rp/admit-all texts)
+        g (guest-rp/admit-all texts)
+        strip (fn [m] (-> m (update :accepted #(mapv normalize-admit %)) (update :refused #(mapv normalize-admit %))))]
+    (check! "admit-all" (= (strip o) (strip g)) [(strip o) (strip g)])
+    (let [accepted (:accepted o)]
+      (doseq [opts [{} {:requested "ken"} {:requested "nope"} {:as "ken"} {:as "nobody"} {:requested "jun" :as "ken"}]]
+        (let [so (normalize-admit (oracle-rp/select accepted opts))
+              sg (normalize-admit (guest-rp/select accepted opts))]
+          (check! (str "select " (pr-str opts)) (= so sg) [so sg]))))
+    (let [dup (into (:accepted o) (:accepted o))]
+      (check! "select duplicate-id"
+              (= (:reason (oracle-rp/select dup {:requested "jun"})) (:reason (guest-rp/select dup {:requested "jun"}))))
+      (check! "select duplicate-for"
+              (= (:reason (oracle-rp/select dup {:as "ken"})) (:reason (guest-rp/select dup {:as "ken"}))))
+      (check! "select ambiguous"
+              (= (:reason (oracle-rp/select dup {})) (:reason (guest-rp/select dup {})))))
+    (check! "select none" (= (:reason (oracle-rp/select [] {})) (:reason (guest-rp/select [] {}))))))
+
+;; ---------------------------------------------------------------------------
+
+(-> (guest/load!)
+    (.then (fn [_] (guest-rp/load!)))
+    (.then (fn [_]
+             (println "artifacts" (pr-str (:artifacts (host/manifest))))
+             (run-commands-corpus!)
+             (run-profile-corpus!)
+             (println (str "CHECKS " @checked " FAILED " @failed))
+             (js/process.exit (if (zero? @failed) 0 1))))
+    (.catch (fn [e]
+              (println "CANNOT MEASURE:" (ex-message e) (pr-str (ex-data e)))
+              (js/process.exit 2))))

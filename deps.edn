@@ -1,18 +1,16 @@
-{:paths ["src" "resources"]
- ;; The command surface of cloud-itonami-app as a dependency: the two pure
- ;; deciders (`cloud.itonami.app.commands`, `cloud.itonami.app.repo-profile`)
- ;; and the three tables they read. Consumers pin THIS repository by git sha
- ;; (cloud-itonami-app, cloud-itonami-cli, cloud-itonami-app/mobile); nothing
- ;; here depends on any of them.
- :deps {org.clojure/clojure {:mvn/version "1.12.0"}
-        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
-        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
-        ;; this repo silently rides whatever a sibling happens to name. Same
-        ;; sha as cloud-itonami-app and cloud-itonami-cli.
-        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}}
- :aliases
- {;; kbb -M:test -> every *_test.cljk under test/ on the kbb engine (cljs.test).
-  :test {:extra-paths ["test"]
-         :main-opts ["-m" "cognitect.test-runner"]}
-  :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
-         :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"]}}}
+{:paths ["src" "resources" "dist"]
+ ;; The command surface of cloud-itonami-app as a dependency, in two forms:
+ ;;
+ ;;   dist/commands.wasm, dist/repo_profile.wasm   the Kotoba components (amu,
+ ;;                                                wasm32, JVM-free build; the
+ ;;                                                host they run under is beside
+ ;;                                                them: dist/browser-host.mjs)
+ ;;   src/cloud/itonami/app/*.cljk                 the Clojure ORACLES, kept
+ ;;                                                until every consumer has cut
+ ;;                                                over (parity gate:
+ ;;                                                test/kotoba_parity_nbb.cljk)
+ ;;
+ ;; No JVM dependency: nothing here declares org.clojure/clojure, a Maven
+ ;; coordinate, or a JVM test runner. The one library is kotoba-lang/text, for
+ ;; the oracles; the sha is an explicit floor, the same one the consumers pin.
+ :deps {io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}}}

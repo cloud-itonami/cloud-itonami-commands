@@ -1,0 +1,101 @@
+(ns cloud.itonami.commands.guest
+  "`cloud.itonami.app.commands`, answered by the Kotoba component
+  (dist/commands.wasm) instead of by Clojure.
+
+  Same names, same values, same throws as the oracle namespace, so a front
+  end cuts over by changing one `require`. Every judgement is the guest's:
+  this file converts argv to a document, reads a document back, and turns
+  the guest's `{:error …}` into the `ex-info` the oracle threw, and its
+  `{:needs …}` into the host effect the oracle took as a closure.
+
+  `load!` must have resolved before any of these is called."
+  (:require [cloud.itonami.kotoba-host :as host]))
+
+(def artifact "commands.wasm")
+
+(defn load! [] (host/load! artifact))
+
+(defn- doc [value] (host/edn->document artifact value))
+(defn- i64 [n] (js/BigInt n))
+(defn- ask [name & args] (apply host/call->clj artifact name args))
+
+(defn- throw-error!
+  "`{:error {:type … :message … …}}` -> the ex-info the oracle threw: the
+  message, and the data with `:type` and every other key the guest attached."
+  [answer]
+  (when-let [e (:error answer)]
+    (throw (ex-info (:message e) (dissoc e :message))))
+  answer)
+
+;; ---- tables ---------------------------------------------------------------
+
+(defn- table [count-export at-export]
+  (let [n (js/Number (host/call artifact count-export))]
+    (mapv #(ask at-export (i64 %)) (range n))))
+
+(defn all [] (table "registry-count" "registry-at"))
+(defn counts [] (ask "counts"))
+(defn alias-commands [] (table "alias-count" "alias-at"))
+(defn host-side-commands [] (table "host-side-count" "host-side-at"))
+
+;; ---- argv -----------------------------------------------------------------
+
+(defn words [argv] (ask "words" (doc (vec argv))))
+(defn parse-flags [argv] (ask "parse-flags" (doc (vec argv))))
+
+(defn resolve-command [words]
+  (let [r (ask "resolve-command" (doc (vec words)))]
+    (when (seq r) r)))
+
+(defn resolve-alias [words] (ask "resolve-alias" (doc (vec words))))
+(defn host-side [words] (ask "host-side" (doc (vec words))))
+(defn resolve-invocation [argv] (ask "resolve-invocation" (doc (vec argv))))
+
+;; ---- names, usage, search -------------------------------------------------
+
+(defn command-name [command] (host/call artifact "command-name" (doc command)))
+(defn usage [command] (host/call artifact "usage" (doc command)))
+
+(defn matching [terms]
+  (let [t (doc (vec terms))
+        n (js/Number (host/call artifact "match-count" t))]
+    (mapv #(ask "match-at" t (i64 %)) (range n))))
+
+;; ---- requests -------------------------------------------------------------
+
+(defn request [command arguments body-override]
+  (throw-error! (ask "request" (doc command) (doc (or arguments {})) (doc (or body-override {})))))
+
+(defn- missing! [what detail]
+  (throw (ex-info what (merge {:type :commands/missing-argument} detail))))
+
+(defn alias-request
+  "`opts` supplies the effects a table cannot carry, as the oracle took them:
+  `:read-file` for `:parse :file-contents`, `:enrollment-key` for `auth
+  login`. The guest answers `{:needs …}` for each one it meets; the effect
+  runs here and the answer goes back in until the request is whole."
+  [alias flags opts]
+  (loop [supplied {} guard 0]
+    (when (> guard 32)
+      (throw (ex-info "alias-request did not converge" {:type :kotoba-host/needs-loop})))
+    (let [answer (throw-error! (ask "alias-request" (doc alias) (doc (or flags {})) (doc supplied)))
+          needs (:needs answer)]
+      (cond
+        (nil? needs) answer
+
+        (= :enrollment-key needs)
+        (if-let [f (:enrollment-key opts)]
+          (recur (assoc supplied :enrollment-key (f)) (inc guard))
+          (missing! "この front end は enrollment key を読めません" {:key :enrollment-key}))
+
+        (:read-file needs)
+        (if-let [f (:read-file opts)]
+          (recur (assoc-in supplied [:file-contents (:read-file needs)] (f (:read-file needs))) (inc guard))
+          (missing! "この front end はファイルを読めません" {:parse :file-contents}))
+
+        (:unknown-parse needs)
+        (missing! (str "未知の :parse " (pr-str (:unknown-parse needs))) {:parse (:unknown-parse needs)})
+
+        :else
+        (throw (ex-info (str "guest asked for something this host does not supply: " (pr-str needs))
+                        {:type :kotoba-host/unknown-need :needs needs}))))))

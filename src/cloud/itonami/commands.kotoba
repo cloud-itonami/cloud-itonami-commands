@@ -1,0 +1,935 @@
+;; cloud.itonami.commands — every operation cloud-itonami-app serves, as a
+;; command an operator can name. The Kotoba component that replaces
+;; `cloud.itonami.app.commands` (src/cloud/itonami/app/commands.cljk, kept as
+;; the oracle until every consumer has cut over; the parity harness is
+;; test/commands_parity_nbb.cljk).
+;;
+;; THIS FILE IS GENERATED. Edit `commands.kotoba.in` and run
+;;   kbb --backend sci scripts/gen_commands_kotoba.cljk
+;; The generator splices the two tables (`resources/cloud-itonami-app.commands.edn`,
+;; `resources/cloud-itonami-app.cli-aliases.edn`) into the marked sections below,
+;; so the registry the app regenerates and the code that resolves it are one
+;; artifact with one CID.
+;;
+;; ## Shape of the boundary
+;;
+;; Every dynamic value crosses as a `:document` (the bounded EDN-shaped tree):
+;; argv in, and out come the same maps `commands.cljk` returned —
+;; `{:kind :alias :command … :flags … :words …}`, `{:method :get :path … :body …}`.
+;; The oracle threw `ex-info` where this returns `{:error {:type … :message …}}`
+;; with the same `:type` and the same data keys; the oracle called host
+;; closures (`:read-file`, `:enrollment-key`) where this returns `{:needs …}`
+;; and the host supplies the value on the next call. Neither is a change in
+;; what a command means; both are the difference between a language that
+;; tracks control effects and one that does not.
+;;
+;; The two tables are not documents: a document holds 256 nodes and the
+;; registry is 211 commands. They are code — `case` tables over an index —
+;; and only the ONE command a caller asks for becomes a document.
+;;
+;; ## Declared-temporary constraints (read `lang/surface-status.edn` before
+;; treating any of these as the language)
+;;
+;; - `[:list T]` cannot grow and `map`/`filter` take vector-i64 only (measured
+;;   2026-09-15, amu 73ddd26: `conj` on `[:list :string]` refused by name,
+;;   `filter` over it "expected vector-i64"). Sequences of strings are
+;;   therefore document vectors here. Removal condition: a growable typed list.
+;; - `typed-map-keys` does not lower on wasm32 (same day, "unsupported typed
+;;   Wasm expression"); maps are iterated as documents (`document-map-entry-at`).
+;; - `throw`/`try` lower on the KIR interpreter only (`:backends #{:compiler}`),
+;;   so every refusal is a value. That one is also the style this language
+;;   asks for at a boundary and would stay if the backends caught up.
+;; - `string-length` counts code points; the oracle's `count` counts UTF-16
+;;   units. They agree outside the astral plane.
+
+(ns cloud.itonami.commands
+  (:export [main read-edn
+            registry-count registry-at counts
+            alias-count alias-at host-side-count host-side-at
+            words parse-flags
+            resolve-command resolve-alias host-side resolve-invocation
+            command-name usage request alias-request
+            match-count match-at
+            url-encode
+            ;; tests — `amu test src/cloud/itonami/commands.kotoba`
+            test-words test-flags test-longest-wins test-alias-shadows-registry
+            test-host-side-is-named test-unknown test-request-get test-request-post
+            test-request-missing-parameter test-alias-request test-alias-needs
+            test-alias-required test-usage test-match test-url-encode
+            test-comma-list test-boolish test-long]))
+
+;; The host ABI wants a `main`; this component has no process to start, so
+;; it answers its own registry size — a number the host can compare with
+;; `registry-count` to know it is talking to the module it thinks it is.
+(defn main [] :i64 (registry-count))
+
+;; The host's way in: EDN text becomes a document inside this instance, in
+;; the reader's canonical order, so the host never builds a document tree
+;; by hand. Costs fuel; that is what the fuel is for.
+(defn read-edn [text :string] :document (document-edn-read text))
+
+;; ---------------------------------------------------------------------------
+;; small helpers over documents and strings
+;; ---------------------------------------------------------------------------
+
+;; Every string offset here is a UTF-8 BYTE offset: `string-length` is the
+;; byte length on every backend (measured 2026-09-15: (string-length "日é")
+;; = 5 on KIR, js and wasm) and `string-code-point-at` refuses an offset
+;; inside a code point. Loops over text advance by the code point's width.
+(defn- cp-width [cp :i64] :i64
+  (cond (< cp 128) 1 (< cp 2048) 2 (< cp 65536) 3 :else 4))
+
+(defn- cat3 [a :string b :string c :string] :string
+  (string-concat a (string-concat b c)))
+
+(defn- cat4 [a :string b :string c :string d :string] :string
+  (string-concat a (cat3 b c d)))
+
+(defn- str-or [d :document fallback :string] :string
+  (option-or (document-string-value d) fallback))
+
+(defn- kw-or [d :document fallback :keyword] :keyword
+  (option-or (document-keyword-value d) fallback))
+
+(defn- get-or-null [d :document k :keyword] :document
+  (option-or (document-get d k) (document-null)))
+
+(defn- get-str [d :document k :keyword fallback :string] :string
+  (str-or (get-or-null d k) fallback))
+
+(defn- at-or-null [v :document i :i64] :document
+  (option-or (document-vector-at v i) (document-null)))
+
+(defn- str-at [v :document i :i64] :string
+  (str-or (at-or-null v i) ""))
+
+(defn- entry-at [m :document i :i64] :document
+  (option-or (document-map-entry-at m i) (document-null)))
+
+(defn- present? [d :document] :bool
+  (not (= :null (document-kind d))))
+
+(defn- count-or-zero [d :document] :i64
+  (if (= :vector (document-kind d)) (document-count d) 0))
+
+;; code point by code point, so a multi-byte first character in `s` is never
+;; split by a byte-length substring (measured 2026-09-15: `string-substring`
+;; traps on "日本語" with a 2-byte prefix).
+(defn- prefix-from? [s :string prefix :string i :i64] :bool
+  (if (>= i (string-length prefix))
+    true
+    (if (>= i (string-length s))
+      false
+      (let [p (string-code-point-at prefix i)]
+        (if (= p (string-code-point-at s i))
+          (prefix-from? s prefix (+ i (cp-width p)))
+          false)))))
+
+(defn- starts-with? [s :string prefix :string] :bool
+  (prefix-from? s prefix 0))
+
+(defn- flag? [s :string] :bool (starts-with? s "--"))
+
+;; `:kind` of a flag value. A bare `--flag` is `true`, a `--flag value` is a
+;; string: the same two kinds `parse-flags` produced in the oracle.
+(defn- truthy-flag? [d :document] :bool
+  (if (= :bool (document-kind d)) (option-or (document-bool-value d) false) false))
+
+;; ---------------------------------------------------------------------------
+;; url-encode — `java.net.URLEncoder/encode` as this app has always sent it:
+;; unreserved are A-Z a-z 0-9 . - * _ ; space is `+`; everything else is the
+;; UTF-8 bytes of the code point, each as %XX.
+;; ---------------------------------------------------------------------------
+
+(defn- mod [a :i64 b :i64] :i64 (- a (* b (quot a b))))
+
+(defn- hex-digit [n :i64] :string
+  (case n 0 "0" 1 "1" 2 "2" 3 "3" 4 "4" 5 "5" 6 "6" 7 "7" 8 "8" 9 "9"
+        10 "A" 11 "B" 12 "C" 13 "D" 14 "E" 15 "F" "?"))
+
+(defn- percent-byte [b :i64] :string
+  (cat3 "%" (hex-digit (quot b 16)) (hex-digit (mod b 16))))
+
+(defn- unreserved? [cp :i64] :bool
+  (cond
+    (and (>= cp 48) (<= cp 57)) true    ; 0-9
+    (and (>= cp 65) (<= cp 90)) true    ; A-Z
+    (and (>= cp 97) (<= cp 122)) true   ; a-z
+    (= cp 46) true                      ; .
+    (= cp 45) true                      ; -
+    (= cp 42) true                      ; *
+    (= cp 95) true                      ; _
+    :else false))
+
+;; The code point itself as text when it is unreserved. There is no
+;; code-point->string builtin, so the unreserved set is spelled out; it is
+;; small and closed.
+(defn- unreserved-text [cp :i64] :string
+  (case cp
+    48 "0" 49 "1" 50 "2" 51 "3" 52 "4" 53 "5" 54 "6" 55 "7" 56 "8" 57 "9"
+    65 "A" 66 "B" 67 "C" 68 "D" 69 "E" 70 "F" 71 "G" 72 "H" 73 "I" 74 "J" 75 "K" 76 "L" 77 "M"
+    78 "N" 79 "O" 80 "P" 81 "Q" 82 "R" 83 "S" 84 "T" 85 "U" 86 "V" 87 "W" 88 "X" 89 "Y" 90 "Z"
+    97 "a" 98 "b" 99 "c" 100 "d" 101 "e" 102 "f" 103 "g" 104 "h" 105 "i" 106 "j" 107 "k" 108 "l" 109 "m"
+    110 "n" 111 "o" 112 "p" 113 "q" 114 "r" 115 "s" 116 "t" 117 "u" 118 "v" 119 "w" 120 "x" 121 "y" 122 "z"
+    46 "." 45 "-" 42 "*" 95 "_"
+    ""))
+
+(defn- utf8-bytes-percent [cp :i64] :string
+  (cond
+    (< cp 128) (percent-byte cp)
+    (< cp 2048) (string-concat (percent-byte (+ 192 (quot cp 64)))
+                               (percent-byte (+ 128 (mod cp 64))))
+    (< cp 65536) (cat3 (percent-byte (+ 224 (quot cp 4096)))
+                       (percent-byte (+ 128 (mod (quot cp 64) 64)))
+                       (percent-byte (+ 128 (mod cp 64))))
+    :else (cat4 (percent-byte (+ 240 (quot cp 262144)))
+                (percent-byte (+ 128 (mod (quot cp 4096) 64)))
+                (percent-byte (+ 128 (mod (quot cp 64) 64)))
+                (percent-byte (+ 128 (mod cp 64))))))
+
+(defn- encode-from [s :string i :i64 n :i64 acc :string] :string
+  (if (>= i n)
+    acc
+    (let [cp (string-code-point-at s i)]
+      (encode-from s (+ i (cp-width cp)) n
+                   (string-concat acc
+                                  (cond (= cp 32) "+"
+                                        (unreserved? cp) (unreserved-text cp)
+                                        :else (utf8-bytes-percent cp)))))))
+
+(defn url-encode [s :string] :string
+  (encode-from s 0 (string-length s) ""))
+
+;; a document value as the text url-encode takes: strings as they are, a bare
+;; flag (`true`) as "true", numbers as digits — what `(str value)` did.
+(defn- value-text [d :document] :string
+  (cond
+    (= :string (document-kind d)) (str-or d "")
+    (= :bool (document-kind d)) (if (option-or (document-bool-value d) false) "true" "false")
+    (= :i64 (document-kind d)) (string-from-i64 (option-or (document-i64-value d) 0))
+    (= :keyword (document-kind d)) (keyword-name (kw-or d :none))
+    :else ""))
+
+;; ---------------------------------------------------------------------------
+;; argv
+;; ---------------------------------------------------------------------------
+
+;; The arguments that name a command: not flags, and not a flag's value.
+;; Walked rather than filtered: `--label claude-code` puts a bare token after
+;; a flag, and a filter would read `claude-code` as a command word.
+(defn- words-from [argv :document i :i64 n :i64 acc :document] :document
+  (if (>= i n)
+    acc
+    (let [w (str-at argv i)]
+      (if (flag? w)
+        (if (< (+ i 1) n)
+          (if (flag? (str-at argv (+ i 1)))
+            (words-from argv (+ i 1) n acc)
+            (words-from argv (+ i 2) n acc))
+          (words-from argv (+ i 1) n acc))
+        (words-from argv (+ i 1) n (document-vector-conj acc (document-string w)))))))
+
+(defn words [argv :document] :document
+  (words-from argv 0 (document-count argv) (document-vector)))
+
+;; `--key value` pairs, and `--key` alone as true. A value that itself starts
+;; with `--` is not consumed.
+(defn- flags-from [argv :document i :i64 n :i64 acc :document] :document
+  (if (>= i n)
+    acc
+    (let [w (str-at argv i)]
+      (if (flag? w)
+        (let [k (keyword-from-string (string-substring w 2 (string-length w)))]
+          (if (< (+ i 1) n)
+            (let [v (str-at argv (+ i 1))]
+              (if (flag? v)
+                (flags-from argv (+ i 1) n (document-assoc acc k (document-bool true)))
+                (flags-from argv (+ i 2) n (document-assoc acc k (document-string v)))))
+            (flags-from argv (+ i 1) n (document-assoc acc k (document-bool true)))))
+        (flags-from argv (+ i 1) n acc)))))
+
+(defn parse-flags [argv :document] :document
+  (flags-from argv 0 (document-count argv) (document-map)))
+
+;; ---------------------------------------------------------------------------
+;; the generated registry: one `case` per accessor, index -> value
+;; ---------------------------------------------------------------------------
+
+;; registry: 211 commands, {:routes 420, :commands 211, :human-only 74, :unauthenticated 135}
+(defn registry-count [] :i64 211)
+(defn- registry-chunks [] :i64 27)
+
+(defn- registry-chunk-c0 [c :i64] :document
+  (case c
+    0 (document-edn-read "[{:command [\"agent-session\"], :method \"GET\", :template \"/api/agent-session\", :flags [], :params []} {:command [\"contracts\"], :method \"GET\", :template \"/api/contracts\", :flags [], :params []} {:command [\"credentials\"], :method \"GET\", :template \"/api/credentials\", :flags [], :params []} {:command [\"esign\"], :method \"GET\", :template \"/api/esign\", :flags [], :params []} {:command [\"mail-sync\"], :method \"GET\", :template \"/api/mail-sync\", :flags [], :params []} {:command [\"organism-workers\"], :method \"GET\", :template \"/api/organism-workers\", :flags [], :params []} {:command [\"session\"], :method \"GET\", :template \"/api/session\", :flags [\"context-set\" \"project\" \"session\"], :params []} {:command [\"work-governance\"], :method \"GET\", :template \"/api/work-governance\", :flags [], :params []}]")
+    1 (document-edn-read "[{:command [\"workers\"], :method \"POST\", :template \"/api/workers\", :flags [], :params []} {:command [\"workspace\"], :method \"GET\", :template \"/api/workspace\", :flags [], :params []} {:command [\"agent-bots\" \"name\"], :method \"POST\", :template \"/api/agent-bots/{agent-bot}/name\", :flags [\"by\" \"name\" \"restore\"], :params [{:name \"agent-bot\"}]} {:command [\"agent-session\" \"revoke\"], :method \"POST\", :template \"/api/agent-session/{agent-session}/revoke\", :flags [], :params [{:name \"agent-session\"}]} {:command [\"business\" \"bind\"], :method \"POST\", :template \"/api/business/{business}/bind\", :flags [], :params [{:name \"business\"}]} {:command [\"business\" \"canvas\"], :method \"GET\", :template \"/api/business/{business}/canvas\", :flags [], :params [{:name \"business\"}]} {:command [\"business\" \"create\"], :method \"POST\", :template \"/api/business\", :flags [], :params []} {:command [\"business\" \"list\"], :method \"GET\", :template \"/api/business\", :flags [], :params []}]")
+    2 (document-edn-read "[{:command [\"business\" \"loops\"], :method \"GET\", :template \"/api/business/{business}/loops\", :flags [], :params [{:name \"business\"}]} {:command [\"business\" \"metrics\"], :method \"GET\", :template \"/api/business/{business}/metrics\", :flags [], :params [{:name \"business\"}]} {:command [\"business\" \"repos\"], :method \"GET\", :template \"/api/business/{business}/repos\", :flags [], :params [{:name \"business\"}]} {:command [\"connections\" \"start\"], :method \"POST\", :template \"/api/connections/{provider}/start\", :flags [\"add-account\"], :params [{:name \"provider\"}]} {:command [\"credentials\" \"membership\"], :method \"POST\", :template \"/api/credentials/membership\", :flags [], :params []} {:command [\"credentials\" \"revoke\"], :method \"POST\", :template \"/api/credentials/{index}/revoke\", :flags [], :params [{:name \"index\"}]} {:command [\"credentials\" \"trusted-issuers\"], :method \"GET\", :template \"/api/credentials/trusted-issuers\", :flags [], :params []} {:command [\"credentials\" \"verify\"], :method \"POST\", :template \"/api/credentials/verify\", :flags [], :params []}]")
+    3 (document-edn-read "[{:command [\"esign\" \"retention\"], :method \"GET\", :template \"/api/esign/retention\", :flags [], :params []} {:command [\"esign\" \"verify\"], :method \"POST\", :template \"/api/esign/verify\", :flags [], :params []} {:command [\"identity\" \"organization\"], :method \"POST\", :template \"/api/identity/organization\", :flags [], :params []} {:command [\"identity\" \"organizations\"], :method \"POST\", :template \"/api/identity/organizations\", :flags [\"domain\"], :params []} {:command [\"identity\" \"users\"], :method \"POST\", :template \"/api/identity/users\", :flags [], :params []} {:command [\"mail\" \"projects\"], :method \"GET\", :template \"/api/mail/projects\", :flags [], :params []} {:command [\"mail\" \"send\"], :method \"POST\", :template \"/api/mail/send\", :flags [\"account-id\"], :params []} {:command [\"mail-sync\" \"sync\"], :method \"POST\", :template \"/api/mail-sync/sync\", :flags [], :params []}]")
+    4 (document-edn-read "[{:command [\"operator\" \"declare\"], :method \"POST\", :template \"/api/operator/declare\", :flags [], :params []} {:command [\"operator\" \"endpoint\"], :method \"POST\", :template \"/api/operator/endpoint\", :flags [], :params []} {:command [\"operator\" \"profile\"], :method \"POST\", :template \"/api/operator/profile\", :flags [], :params []} {:command [\"operator\" \"withdraw\"], :method \"POST\", :template \"/api/operator/withdraw\", :flags [], :params []} {:command [\"organism-workers\" \"activity\"], :method \"GET\", :template \"/api/organism-workers/{organism-worker}/activity\", :flags [\"cursor\" \"limit\"], :params [{:name \"organism-worker\"}]} {:command [\"organism-workers\" \"intents\"], :method \"POST\", :template \"/api/organism-workers/{organism-worker}/intents\", :flags [\"capability\"], :params [{:name \"organism-worker\"}]} {:command [\"organism-workers\" \"messenger-transport\"], :method \"POST\", :template \"/api/organism-workers/{organism-worker}/messenger-transport\", :flags [], :params [{:name \"organism-worker\"}]} {:command [\"organism-workers\" \"receipts\"], :method \"GET\", :template \"/api/organism-workers/{organism-worker}/receipts\", :flags [], :params [{:name \"organism-worker\"}]}]")
+    5 (document-edn-read "[{:command [\"organism-workers\" \"snapshot\"], :method \"GET\", :template \"/api/organism-workers/{organism-worker}/snapshot\", :flags [], :params [{:name \"organism-worker\"}]} {:command [\"passkeys\" \"assurance\"], :method \"GET\", :template \"/api/passkeys/assurance\", :flags [], :params []} {:command [\"portfolio\" \"matrix\"], :method \"GET\", :template \"/api/portfolio/matrix\", :flags [], :params []} {:command [\"projects\" \"create\"], :method \"POST\", :template \"/api/projects\", :flags [\"description\" \"project\" \"title\"], :params []} {:command [\"projects\" \"list\"], :method \"GET\", :template \"/api/projects\", :flags [], :params []} {:command [\"projects\" \"mail\"], :method \"GET\", :template \"/api/projects/{project}/mail\", :flags [], :params [{:name \"project\"}]} {:command [\"projects\" \"push\"], :method \"POST\", :template \"/api/projects/{project}/push\", :flags [], :params [{:name \"project\"}]} {:command [\"projects\" \"remote\"], :method \"GET\", :template \"/api/projects/{project}/remote\", :flags [], :params [{:name \"project\"}]}]")
+    6 (document-edn-read "[{:command [\"projects\" \"show\"], :method \"GET\", :template \"/api/projects/{project}\", :flags [], :params [{:name \"project\"}]} {:command [\"session\" \"context\"], :method \"POST\", :template \"/api/session/context\", :flags [\"refs\" \"session\"], :params []} {:command [\"sites\" \"list\"], :method \"GET\", :template \"/api/sites\", :flags [], :params []} {:command [\"sites\" \"preview\"], :method \"GET\", :template \"/api/sites/{site}/preview\", :flags [], :params [{:name \"site\"}]} {:command [\"sites\" \"show\"], :method \"GET\", :template \"/api/sites/{site}\", :flags [], :params [{:name \"site\"}]} {:command [\"storefront\" \"current\"], :method \"GET\", :template \"/api/storefront/current\", :flags [], :params []} {:command [\"update\" \"download\"], :method \"POST\", :template \"/api/update/download\", :flags [], :params []} {:command [\"v1\" \"tenants\"], :method \"GET\", :template \"/v1/tenants\", :flags [], :params []}]")
+    7 (document-edn-read "[{:command [\"work-governance\" \"approval-policies\"], :method \"POST\", :template \"/api/work-governance/approval-policies\", :flags [], :params []} {:command [\"work-governance\" \"health\"], :method \"GET\", :template \"/api/work-governance/health\", :flags [], :params []} {:command [\"work-governance\" \"organizations\"], :method \"POST\", :template \"/api/work-governance/organizations\", :flags [], :params []} {:command [\"work-governance\" \"reconcile\"], :method \"POST\", :template \"/api/work-governance/reconcile\", :flags [], :params []} {:command [\"work-governance\" \"roles\"], :method \"POST\", :template \"/api/work-governance/roles\", :flags [], :params []} {:command [\"work-governance\" \"work-items\"], :method \"POST\", :template \"/api/work-governance/work-items\", :flags [], :params []} {:command [\"workers\" \"cancel\"], :method \"POST\", :template \"/api/workers/{worker}/cancel\", :flags [], :params [{:name \"worker\"}]} {:command [\"workers\" \"clear\"], :method \"POST\", :template \"/api/workers/clear\", :flags [], :params []}]")
+    8 (document-edn-read "[{:command [\"workspace\" \"bulky-waste\"], :method \"GET\", :template \"/api/workspace/bulky-waste\", :flags [], :params []} {:command [\"workspace\" \"drive\"], :method \"GET\", :template \"/api/workspace/drive\", :flags [], :params []} {:command [\"workspace\" \"human-work\"], :method \"GET\", :template \"/api/workspace/human-work\", :flags [], :params []} {:command [\"workspace\" \"inbox\"], :method \"GET\", :template \"/api/workspace/inbox\", :flags [\"label\" \"q\" \"unread\"], :params []} {:command [\"workspace\" \"lawfirm\"], :method \"GET\", :template \"/api/workspace/lawfirm\", :flags [], :params []} {:command [\"workspace\" \"projects\"], :method \"GET\", :template \"/api/workspace/projects\", :flags [], :params []} {:command [\"workspace\" \"resources\"], :method \"GET\", :template \"/api/workspace/resources\", :flags [], :params []} {:command [\"workspace\" \"scheduler\"], :method \"GET\", :template \"/api/workspace/scheduler\", :flags [], :params []}]")
+    9 (document-edn-read "[{:command [\"workspace\" \"worker\"], :method \"GET\", :template \"/api/workspace/worker\", :flags [], :params []} {:command [\"agent-bots\" \"imports\" \"list\"], :method \"GET\", :template \"/api/agent-bots/imports\", :flags [], :params []} {:command [\"agent-bots\" \"imports\" \"provision\"], :method \"POST\", :template \"/api/agent-bots/imports/{import}/provision\", :flags [\"carry-over-permissions\"], :params [{:name \"import\"}]} {:command [\"agent-bots\" \"imports\" \"show\"], :method \"GET\", :template \"/api/agent-bots/imports/{import}\", :flags [], :params [{:name \"import\"}]} {:command [\"agent-bots\" \"messages\" \"cancel\"], :method \"POST\", :template \"/api/agent-bots/{agent-bot}/messages/{message}/cancel\", :flags [], :params [{:name \"agent-bot\"} {:name \"message\"}]} {:command [\"agent-bots\" \"runs\" \"trajectory\"], :method \"GET\", :template \"/api/agent-bots/{agent-bot}/runs/{run}/trajectory\", :flags [], :params [{:name \"agent-bot\"} {:name \"run\"}]} {:command [\"business\" \"canvas\" \"propose\"], :method \"POST\", :template \"/api/business/{business}/canvas/propose\", :flags [], :params [{:name \"business\"}]} {:command [\"cloud\" \"alias\" \"create\"], :method \"POST\", :template \"/api/cloud/alias\", :flags [\"destination\"], :params []}]")
+    10 (document-edn-read "[{:command [\"cloud\" \"alias\" \"list\"], :method \"GET\", :template \"/api/cloud/alias\", :flags [], :params []} {:command [\"credentials\" \"membership\" \"sd-jwt-vc\"], :method \"POST\", :template \"/api/credentials/membership/sd-jwt-vc\", :flags [], :params []} {:command [\"credentials\" \"sd-jwt-vc\" \"verify\"], :method \"POST\", :template \"/api/credentials/sd-jwt-vc/verify\", :flags [\"credential\" \"presentation\"], :params []} {:command [\"credentials\" \"verify\" \"external\"], :method \"POST\", :template \"/api/credentials/verify/external\", :flags [], :params []} {:command [\"esign\" \"envelopes\" \"compliance\"], :method \"GET\", :template \"/api/esign/envelopes/{envelope}/compliance\", :flags [], :params [{:name \"envelope\"}]} {:command [\"esign\" \"envelopes\" \"create\"], :method \"POST\", :template \"/api/esign/envelopes\", :flags [\"document-id\" \"intent\" \"purpose\" \"signer-dids\"], :params []} {:command [\"esign\" \"envelopes\" \"decline\"], :method \"POST\", :template \"/api/esign/envelopes/{envelope}/decline\", :flags [\"reason\"], :params [{:name \"envelope\"}]} {:command [\"esign\" \"envelopes\" \"evidence\"], :method \"GET\", :template \"/api/esign/envelopes/{envelope}/evidence\", :flags [], :params [{:name \"envelope\"}]}]")
+    11 (document-edn-read "[{:command [\"esign\" \"envelopes\" \"forget-content\"], :method \"POST\", :template \"/api/esign/envelopes/{envelope}/forget-content\", :flags [], :params [{:name \"envelope\"}]} {:command [\"esign\" \"envelopes\" \"retention\"], :method \"POST\", :template \"/api/esign/envelopes/{envelope}/retention\", :flags [\"amount-minor\" \"basis\" \"counterparty\" \"currency\" \"note\" \"transaction-date\"], :params [{:name \"envelope\"}]} {:command [\"esign\" \"envelopes\" \"show\"], :method \"GET\", :template \"/api/esign/envelopes/{envelope}\", :flags [], :params [{:name \"envelope\"}]} {:command [\"identity\" \"organizations\" \"accept\"], :method \"POST\", :template \"/api/identity/organizations/accept\", :flags [], :params []} {:command [\"identity\" \"organizations\" \"switch\"], :method \"POST\", :template \"/api/identity/organizations/switch\", :flags [], :params []} {:command [\"mail\" \"accounts\" \"create\"], :method \"POST\", :template \"/api/mail/accounts\", :flags [], :params []} {:command [\"mail\" \"accounts\" \"delete\"], :method \"DELETE\", :template \"/api/mail/accounts/{account}\", :flags [], :params [{:name \"account\"}]} {:command [\"mail\" \"accounts\" \"list\"], :method \"GET\", :template \"/api/mail/accounts\", :flags [], :params []}]")
+    12 (document-edn-read "[{:command [\"mail\" \"accounts\" \"sync\"], :method \"POST\", :template \"/api/mail/accounts/{account}/sync\", :flags [], :params [{:name \"account\"}]} {:command [\"mail\" \"projects\" \"apply\"], :method \"POST\", :template \"/api/mail/projects/apply\", :flags [], :params []} {:command [\"mail\" \"projects\" \"assign\"], :method \"POST\", :template \"/api/mail/projects/assign\", :flags [\"message\" \"project\"], :params []} {:command [\"mail\" \"projects\" \"assign-thread\"], :method \"POST\", :template \"/api/mail/projects/assign-thread\", :flags [\"project\" \"thread\"], :params []} {:command [\"mail\" \"projects\" \"authentication\"], :method \"GET\", :template \"/api/mail/projects/authentication\", :flags [], :params []} {:command [\"mail\" \"projects\" \"rules\"], :method \"POST\", :template \"/api/mail/projects/rules\", :flags [\"from\" \"from-domain\" \"label\" \"project\" \"subject-contains\"], :params []} {:command [\"mail\" \"projects\" \"unassign\"], :method \"POST\", :template \"/api/mail/projects/unassign\", :flags [\"message\" \"project\"], :params []} {:command [\"mail\" \"projects\" \"unassigned\"], :method \"GET\", :template \"/api/mail/projects/unassigned\", :flags [], :params []}]")
+    13 (document-edn-read "[{:command [\"organism-workers\" \"intents\" \"decision\"], :method \"POST\", :template \"/api/organism-workers/{organism-worker}/intents/{intent}/decision\", :flags [\"decision\" \"reason\"], :params [{:name \"organism-worker\"} {:name \"intent\"}]} {:command [\"passkeys\" \"register\" \"finish\"], :method \"POST\", :template \"/api/passkeys/register/finish\", :flags [\"credential\" \"transaction-id\"], :params []} {:command [\"passkeys\" \"register\" \"start\"], :method \"POST\", :template \"/api/passkeys/register/start\", :flags [], :params []} {:command [\"presentations\" \"requests\" \"create\"], :method \"POST\", :template \"/api/presentations/requests\", :flags [], :params []} {:command [\"presentations\" \"requests\" \"list\"], :method \"GET\", :template \"/api/presentations/requests\", :flags [], :params []} {:command [\"projects\" \"issues\" \"create\"], :method \"POST\", :template \"/api/projects/{project}/issues\", :flags [], :params [{:name \"project\"}]} {:command [\"projects\" \"issues\" \"update\"], :method \"POST\", :template \"/api/projects/{project}/issues/{issue}\", :flags [], :params [{:name \"project\"} {:name \"issue\"}]} {:command [\"session\" \"context\" \"sources\"], :method \"GET\", :template \"/api/session/context/sources\", :flags [], :params []}]")
+    14 (document-edn-read "[{:command [\"v1\" \"tenant-connections\" \"context\"], :method \"POST\", :template \"/v1/tenant-connections/{tenant-connection}/context\", :flags [\"capability\"], :params [{:name \"tenant-connection\"}]} {:command [\"v1\" \"tenant-connections\" \"create\"], :method \"POST\", :template \"/v1/tenant-connections\", :flags [], :params []} {:command [\"v1\" \"tenant-connections\" \"list\"], :method \"GET\", :template \"/v1/tenant-connections\", :flags [], :params []} {:command [\"v1\" \"tenant-connections\" \"renew\"], :method \"POST\", :template \"/v1/tenant-connections/{tenant-connection}/renew\", :flags [\"ttl-seconds\"], :params [{:name \"tenant-connection\"}]} {:command [\"v1\" \"tenant-connections\" \"revoke\"], :method \"POST\", :template \"/v1/tenant-connections/{tenant-connection}/revoke\", :flags [], :params [{:name \"tenant-connection\"}]} {:command [\"v1\" \"tenant-connections\" \"show\"], :method \"GET\", :template \"/v1/tenant-connections/{tenant-connection}\", :flags [], :params [{:name \"tenant-connection\"}]} {:command [\"work-governance\" \"dead-letters\" \"replay\"], :method \"POST\", :template \"/api/work-governance/dead-letters/{dead-letter}/replay\", :flags [], :params [{:name \"dead-letter\"}]} {:command [\"work-governance\" \"work-items\" \"complete\"], :method \"POST\", :template \"/api/work-governance/work-items/{work-item}/complete\", :flags [], :params [{:name \"work-item\"}]}]")
+    15 (document-edn-read "[{:command [\"work-governance\" \"work-items\" \"verifications\"], :method \"POST\", :template \"/api/work-governance/work-items/{work-item}/verifications\", :flags [], :params [{:name \"work-item\"}]} {:command [\"workspace\" \"bulky-waste\" \"jobs\"], :method \"POST\", :template \"/api/workspace/bulky-waste/jobs\", :flags [], :params []} {:command [\"workspace\" \"bulky-waste\" \"workers\"], :method \"POST\", :template \"/api/workspace/bulky-waste/workers\", :flags [], :params []} {:command [\"workspace\" \"drive\" \"import\"], :method \"POST\", :template \"/api/workspace/drive/import\", :flags [\"folder\" \"format\" \"title\"], :params []} {:command [\"workspace\" \"drive\" \"search\"], :method \"GET\", :template \"/api/workspace/drive/search\", :flags [], :params []} {:command [\"workspace\" \"drive\" \"upload\"], :method \"POST\", :template \"/api/workspace/drive/upload\", :flags [\"filename\" \"folder\" \"media-type\"], :params []} {:command [\"workspace\" \"human-work\" \"requests\"], :method \"POST\", :template \"/api/workspace/human-work/requests\", :flags [], :params []} {:command [\"workspace\" \"human-work\" \"workers\"], :method \"POST\", :template \"/api/workspace/human-work/workers\", :flags [], :params []}]")
+    (document-null)))
+
+(defn- registry-chunk-c1 [c :i64] :document
+  (case c
+    16 (document-edn-read "[{:command [\"workspace\" \"lawfirm\" \"docket\"], :method \"GET\", :template \"/api/workspace/lawfirm/docket\", :flags [], :params []} {:command [\"workspace\" \"lawfirm\" \"fax\"], :method \"GET\", :template \"/api/workspace/lawfirm/fax\", :flags [], :params []} {:command [\"workspace\" \"lawfirm\" \"summary\"], :method \"GET\", :template \"/api/workspace/lawfirm/summary\", :flags [], :params []} {:command [\"workspace\" \"scheduler\" \"events\"], :method \"POST\", :template \"/api/workspace/scheduler/events\", :flags [\"attendees\" \"end\" \"start\" \"title\"], :params []} {:command [\"agent-bots\" \"imports\" \"hermes\" \"preview\"], :method \"POST\", :template \"/api/agent-bots/imports/hermes/preview\", :flags [\"business\" \"home\"], :params []} {:command [\"agent-bots\" \"imports\" \"hermes\" \"stage\"], :method \"POST\", :template \"/api/agent-bots/imports/hermes/stage\", :flags [\"home\" \"manifest\"], :params []} {:command [\"business\" \"canvas\" \"proposals\" \"withdraw\"], :method \"POST\", :template \"/api/business/{business}/canvas/proposals/{proposal}/withdraw\", :flags [], :params [{:name \"business\"} {:name \"proposal\"}]} {:command [\"esign\" \"envelopes\" \"sign\" \"finish\"], :method \"POST\", :template \"/api/esign/envelopes/{envelope}/sign/finish\", :flags [\"credential\" \"transaction-id\"], :params [{:name \"envelope\"}]}]")
+    17 (document-edn-read "[{:command [\"esign\" \"envelopes\" \"sign\" \"start\"], :method \"POST\", :template \"/api/esign/envelopes/{envelope}/sign/start\", :flags [], :params [{:name \"envelope\"}]} {:command [\"mail\" \"projects\" \"messages\" \"show\"], :method \"GET\", :template \"/api/mail/projects/messages/{message}\", :flags [], :params [{:name \"message\"}]} {:command [\"mail\" \"projects\" \"rules\" \"remove\"], :method \"POST\", :template \"/api/mail/projects/rules/{rule}/remove\", :flags [], :params [{:name \"rule\"}]} {:command [\"v1\" \"file-provider\" \"items\" \"delete\"], :method \"DELETE\", :template \"/v1/file-provider/items/{item}\", :flags [\"expires-at\" \"goal\" \"parent\" \"run-id\" \"text\"], :params [{:name \"item\"}]} {:command [\"v1\" \"tenant-connections\" \"repository\" \"create\"], :method \"POST\", :template \"/v1/tenant-connections/{tenant-connection}/repository\", :flags [], :params [{:name \"tenant-connection\"}]} {:command [\"v1\" \"tenant-connections\" \"repository\" \"list\"], :method \"GET\", :template \"/v1/tenant-connections/{tenant-connection}/repository\", :flags [], :params [{:name \"tenant-connection\"}]} {:command [\"v1\" \"tenant-connections\" \"repository\" \"publish\"], :method \"POST\", :template \"/v1/tenant-connections/{tenant-connection}/repository/publish\", :flags [], :params [{:name \"tenant-connection\"}]} {:command [\"workspace\" \"bulky-waste\" \"jobs\" \"book\"], :method \"POST\", :template \"/api/workspace/bulky-waste/jobs/{job}/book\", :flags [], :params [{:name \"job\"}]}]")
+    18 (document-edn-read "[{:command [\"workspace\" \"bulky-waste\" \"jobs\" \"cancel\"], :method \"POST\", :template \"/api/workspace/bulky-waste/jobs/{job}/cancel\", :flags [\"organization-id\"], :params [{:name \"job\"}]} {:command [\"workspace\" \"bulky-waste\" \"jobs\" \"check-in\"], :method \"POST\", :template \"/api/workspace/bulky-waste/jobs/{job}/check-in\", :flags [], :params [{:name \"job\"}]} {:command [\"workspace\" \"bulky-waste\" \"jobs\" \"collect\"], :method \"POST\", :template \"/api/workspace/bulky-waste/jobs/{job}/collect\", :flags [], :params [{:name \"job\"}]} {:command [\"workspace\" \"bulky-waste\" \"jobs\" \"deliver\"], :method \"POST\", :template \"/api/workspace/bulky-waste/jobs/{job}/deliver\", :flags [], :params [{:name \"job\"}]} {:command [\"workspace\" \"bulky-waste\" \"jobs\" \"matches\"], :method \"GET\", :template \"/api/workspace/bulky-waste/jobs/{job}/matches\", :flags [], :params [{:name \"job\"}]} {:command [\"workspace\" \"bulky-waste\" \"jobs\" \"publish\"], :method \"POST\", :template \"/api/workspace/bulky-waste/jobs/{job}/publish\", :flags [], :params [{:name \"job\"}]} {:command [\"workspace\" \"bulky-waste\" \"jobs\" \"recover\"], :method \"POST\", :template \"/api/workspace/bulky-waste/jobs/{job}/recover\", :flags [], :params [{:name \"job\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"copy\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/copy\", :flags [\"folder\" \"title\"], :params [{:name \"document\"}]}]")
+    19 (document-edn-read "[{:command [\"workspace\" \"drive\" \"documents\" \"create\"], :method \"POST\", :template \"/api/workspace/drive/documents\", :flags [\"folder\" \"kind\" \"title\"], :params []} {:command [\"workspace\" \"drive\" \"documents\" \"download\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/download\", :flags [], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"export\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/export\", :flags [\"format\" \"tab\"], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"form\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/form\", :flags [], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"history\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/history\", :flags [], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"move\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/move\", :flags [\"folder\"], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"preview\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/preview\", :flags [], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"print\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/print\", :flags [], :params [{:name \"document\"}]}]")
+    20 (document-edn-read "[{:command [\"workspace\" \"drive\" \"documents\" \"prune\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/prune\", :flags [\"keep\"], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"purge\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/purge\", :flags [], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"references\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/references\", :flags [], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"rename\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/rename\", :flags [\"title\"], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"responses-sheet\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/responses-sheet\", :flags [], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"restore\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/restore\", :flags [], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"rows\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/rows\", :flags [\"action\" \"at\" \"axis\" \"count\" \"etag\" \"tab\"], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"show\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}\", :flags [], :params [{:name \"document\"}]}]")
+    21 (document-edn-read "[{:command [\"workspace\" \"drive\" \"documents\" \"sort\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/sort\", :flags [\"by\" \"etag\" \"range\" \"tab\"], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"trash\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/trash\", :flags [], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"folders\" \"create\"], :method \"POST\", :template \"/api/workspace/drive/folders\", :flags [\"folder\" \"title\"], :params []} {:command [\"workspace\" \"drive\" \"folders\" \"list\"], :method \"GET\", :template \"/api/workspace/drive/folders\", :flags [], :params []} {:command [\"workspace\" \"drive\" \"shared\" \"show\"], :method \"GET\", :template \"/api/workspace/drive/shared/{link}\", :flags [], :params [{:name \"link\"}]} {:command [\"workspace\" \"drive\" \"shared\" \"submissions\"], :method \"POST\", :template \"/api/workspace/drive/shared/{link}/submissions\", :flags [], :params [{:name \"link\"}]} {:command [\"workspace\" \"drive\" \"trash\" \"empty\"], :method \"POST\", :template \"/api/workspace/drive/trash/empty\", :flags [], :params []} {:command [\"workspace\" \"human-work\" \"requests\" \"accept\"], :method \"POST\", :template \"/api/workspace/human-work/requests/{request}/accept\", :flags [], :params [{:name \"request\"}]}]")
+    22 (document-edn-read "[{:command [\"workspace\" \"human-work\" \"requests\" \"cancel\"], :method \"POST\", :template \"/api/workspace/human-work/requests/{request}/cancel\", :flags [], :params [{:name \"request\"}]} {:command [\"workspace\" \"human-work\" \"requests\" \"matches\"], :method \"GET\", :template \"/api/workspace/human-work/requests/{request}/matches\", :flags [], :params [{:name \"request\"}]} {:command [\"workspace\" \"human-work\" \"requests\" \"publish\"], :method \"POST\", :template \"/api/workspace/human-work/requests/{request}/publish\", :flags [], :params [{:name \"request\"}]} {:command [\"workspace\" \"human-work\" \"requests\" \"review\"], :method \"POST\", :template \"/api/workspace/human-work/requests/{request}/review\", :flags [], :params [{:name \"request\"}]} {:command [\"workspace\" \"human-work\" \"requests\" \"start\"], :method \"POST\", :template \"/api/workspace/human-work/requests/{request}/start\", :flags [], :params [{:name \"request\"}]} {:command [\"workspace\" \"human-work\" \"requests\" \"submit\"], :method \"POST\", :template \"/api/workspace/human-work/requests/{request}/submit\", :flags [], :params [{:name \"request\"}]} {:command [\"workspace\" \"inbox\" \"messages\" \"label\"], :method \"POST\", :template \"/api/workspace/inbox/messages/{message}/label\", :flags [\"label\"], :params [{:name \"message\"}]} {:command [\"workspace\" \"inbox\" \"messages\" \"read\"], :method \"POST\", :template \"/api/workspace/inbox/messages/{message}/read\", :flags [], :params [{:name \"message\"}]}]")
+    23 (document-edn-read "[{:command [\"workspace\" \"inbox\" \"messages\" \"trash\"], :method \"POST\", :template \"/api/workspace/inbox/messages/{message}/trash\", :flags [], :params [{:name \"message\"}]} {:command [\"workspace\" \"inbox\" \"threads\" \"show\"], :method \"GET\", :template \"/api/workspace/inbox/threads/{thread}\", :flags [], :params [{:name \"thread\"}]} {:command [\"workspace\" \"lawfirm\" \"fax\" \"dispatch\"], :method \"POST\", :template \"/api/workspace/lawfirm/fax/dispatch\", :flags [], :params []} {:command [\"workspace\" \"lawfirm\" \"inbound\" \"sync\"], :method \"POST\", :template \"/api/workspace/lawfirm/inbound/sync\", :flags [], :params []} {:command [\"workspace\" \"lawfirm\" \"matters\" \"drive\"], :method \"POST\", :template \"/api/workspace/lawfirm/matters/{matter}/drive\", :flags [], :params [{:name \"matter\"}]} {:command [\"workspace\" \"scheduler\" \"events\" \"cancel\"], :method \"POST\", :template \"/api/workspace/scheduler/events/{event}/cancel\", :flags [], :params [{:name \"event\"}]} {:command [\"workspace\" \"scheduler\" \"events\" \"conflicts\"], :method \"GET\", :template \"/api/workspace/scheduler/events/{event}/conflicts\", :flags [], :params [{:name \"event\"}]} {:command [\"workspace\" \"scheduler\" \"events\" \"invite\"], :method \"POST\", :template \"/api/workspace/scheduler/events/{event}/invite\", :flags [\"person\"], :params [{:name \"event\"}]}]")
+    24 (document-edn-read "[{:command [\"workspace\" \"scheduler\" \"events\" \"respond\"], :method \"POST\", :template \"/api/workspace/scheduler/events/{event}/respond\", :flags [\"status\"], :params [{:name \"event\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"comments\" \"create\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/comments\", :flags [\"anchor\" \"parent-id\" \"text\"], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"comments\" \"delete\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/comments/{comment}/delete\", :flags [], :params [{:name \"document\"} {:name \"comment\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"comments\" \"list\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/comments\", :flags [], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"comments\" \"resolve\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/comments/{comment}/resolve\", :flags [], :params [{:name \"document\"} {:name \"comment\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"pages\" \"list\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/pages\", :flags [\"action\" \"expires-in-hours\" \"handoff\" \"principal\" \"role\" \"session-id\" \"token\"], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"pages\" \"show\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/pages/{page}\", :flags [\"action\" \"expires-in-hours\" \"handoff\" \"principal\" \"role\" \"session-id\" \"token\"], :params [{:name \"document\"} {:name \"page\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"submissions\" \"create\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/submissions\", :flags [], :params [{:name \"document\"}]}]")
+    25 (document-edn-read "[{:command [\"workspace\" \"drive\" \"documents\" \"submissions\" \"list\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/submissions\", :flags [], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"suggestions\" \"accept\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/suggestions/{suggestion}/accept\", :flags [], :params [{:name \"document\"} {:name \"suggestion\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"suggestions\" \"create\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/suggestions\", :flags [\"block\" \"text\"], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"suggestions\" \"list\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/suggestions\", :flags [], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"suggestions\" \"reject\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/suggestions/{suggestion}/reject\", :flags [], :params [{:name \"document\"} {:name \"suggestion\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"versions\" \"create\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/versions\", :flags [], :params [{:name \"document\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"versions\" \"restore\"], :method \"POST\", :template \"/api/workspace/drive/documents/{document}/versions/{version}/restore\", :flags [\"etag\"], :params [{:name \"document\"} {:name \"version\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"versions\" \"show\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/versions/{version}\", :flags [], :params [{:name \"document\"} {:name \"version\"}]}]")
+    26 (document-edn-read "[{:command [\"workspace\" \"human-work\" \"workers\" \"credentials\" \"verify\"], :method \"POST\", :template \"/api/workspace/human-work/workers/{worker}/credentials/{index}/verify\", :flags [], :params [{:name \"worker\"} {:name \"index\"}]} {:command [\"workspace\" \"human-work\" \"workers\" \"locations\" \"verify\"], :method \"POST\", :template \"/api/workspace/human-work/workers/{worker}/locations/{location}/verify\", :flags [], :params [{:name \"worker\"} {:name \"location\"}]} {:command [\"workspace\" \"drive\" \"documents\" \"pages\" \"images\" \"show\"], :method \"GET\", :template \"/api/workspace/drive/documents/{document}/pages/{page}/images/{image}\", :flags [\"action\" \"expires-in-hours\" \"handoff\" \"principal\" \"role\" \"session-id\" \"token\"], :params [{:name \"document\"} {:name \"page\"} {:name \"image\"}]}]")
+    (document-null)))
+
+(defn registry-chunk [c :i64] :document
+  (case (quot c 16)
+    0 (registry-chunk-c0 c)
+    1 (registry-chunk-c1 c)
+    (document-null)))
+
+(defn counts [] :document (document-edn-read "{:routes 420, :commands 211, :human-only 74, :unauthenticated 135}"))
+
+
+;; ---------------------------------------------------------------------------
+;; the reviewed alias table and the host-side list, the same way
+;; ---------------------------------------------------------------------------
+
+;; aliases: 35 commands, 3 host-side
+(defn alias-count [] :i64 35)
+(defn- alias-chunks [] :i64 5)
+
+(defn- alias-chunk-c0 [c :i64] :document
+  (case c
+    0 (document-edn-read "[{:command [\"auth\" \"login\"], :method :post, :template \"/api/agent-session\", :body {:enrollment-key {:enrollment-key true}, :label {:flag :label, :default \"cli\"}, :user-id {:flag :user-id}, :organization-id {:flag :organization}, :ttl-days {:flag :ttl-days, :parse :long}}, :stores-token? true} {:command [\"auth\" \"status\"], :method :get, :template \"/api/agent-session\"} {:command [\"auth\" \"revoke\"], :method :post, :template \"/api/agent-session/{id}/revoke\", :params [{:name \"id\", :flag :id, :required? true, :hint \"auth status で確認できます\"}]} {:command [\"tenant\" \"list\"], :method :get, :template \"/v1/tenants\"} {:command [\"tenant\" \"connections\"], :method :get, :template \"/v1/tenant-connections\"} {:command [\"tenant\" \"connect\"], :method :post, :template \"/v1/tenant-connections\", :body {:tenant_id {:flag :tenant}, :agent_id {:flag :agent-id}, :capabilities {:flag :cap, :parse :comma-list}, :ttl_seconds {:flag :ttl-seconds, :parse :long}, :budget {:max_operations {:flag :max-operations, :parse :long}, :max_storage_bytes {:flag :max-storage-bytes, :parse :long}}, :idempotency_key {:flag :idempotency-key}}} {:command [\"tenant\" \"status\"], :method :get, :template \"/v1/tenant-connections/{connection}\", :params [{:name \"connection\", :flag :connection, :required? true}]} {:command [\"tenant\" \"renew\"], :method :post, :template \"/v1/tenant-connections/{connection}/renew\", :params [{:name \"connection\", :flag :connection, :required? true}], :body {:ttl_seconds {:flag :ttl-seconds, :parse :long}}}]")
+    1 (document-edn-read "[{:command [\"tenant\" \"revoke\"], :method :post, :template \"/v1/tenant-connections/{connection}/revoke\", :params [{:name \"connection\", :flag :connection, :required? true}]} {:command [\"tenant\" \"context\"], :method :post, :template \"/v1/tenant-connections/{connection}/context\", :params [{:name \"connection\", :flag :connection, :required? true}], :body {:capability {:flag :capability}}} {:command [\"tenant\" \"repository-read\"], :method :get, :template \"/v1/tenant-connections/{connection}/repository\", :params [{:name \"connection\", :flag :connection, :required? true}]} {:command [\"tenant\" \"repository-write\"], :method :post, :template \"/v1/tenant-connections/{connection}/repository\", :params [{:name \"connection\", :flag :connection, :required? true}], :body {:state_edn {:flag :file, :required? true, :parse :file-contents}, :expected_cid {:flag :expected-cid}}} {:command [\"tenant\" \"repository-publish\"], :method :post, :template \"/v1/tenant-connections/{connection}/repository/publish\", :params [{:name \"connection\", :flag :connection, :required? true}]} {:command [\"business\" \"list\"], :method :get, :template \"/api/business\"} {:command [\"business\" \"create\"], :method :post, :template \"/api/business\", :body {:slug {:flag :slug}, :name {:flag :name}, :note {:flag :note}}} {:command [\"business\" \"bind\"], :method :post, :template \"/api/business/{id}/bind\", :params [{:name \"id\", :flag :id, :required? true}], :body {:repos {:flag :repos, :parse :comma-list}, :adoptions {:flag :adoptions, :parse :comma-list}, :canvas {:flag :canvas}, :model {:flag :model}, :leverage {:flag :leverage}, :lei {:flag :lei}}, :requires-one-of [:repos :adoptions :canvas :model :leverage :lei]}]")
+    2 (document-edn-read "[{:command [\"bots\" \"list\"], :method :get, :template \"/api/agent-bots\"} {:command [\"bots\" \"workforce\"], :method :get, :template \"/api/agent-bots/workforce\"} {:command [\"bots\" \"provision\"], :method :post, :template \"/api/agent-bots/workforce/provision\", :timeout-seconds 120} {:command [\"bots\" \"messages\"], :method :get, :template \"/api/agent-bots/{id}/messages\", :params [{:name \"id\", :flag :id, :required? true}]} {:command [\"bots\" \"model\"], :method :post, :template \"/api/agent-bots/{id}/model\", :params [{:name \"id\", :flag :id, :required? true}], :body {:provider-id {:flag :provider, :required? true}, :model {:flag :model, :required? true}}} {:command [\"bots\" \"task\"], :method :post, :template \"/api/agent-bots/{id}/messages\", :params [{:name \"id\", :flag :id, :required? true}], :body {:text {:flag :text, :required? true}}, :timeout-seconds 660} {:command [\"bots\" \"handoff\"], :method :post, :template \"/api/agent-bots/{from}/handoff\", :params [{:name \"from\", :flag :from, :required? true}], :body {:to {:flag :to, :required? true}, :task {:flag :task, :required? true}, :depth {:flag :depth, :parse :long}}, :timeout-seconds 660} {:command [\"bots\" \"decide\"], :method :post, :template \"/api/agent-bots/{id}/cards/{card}/decide\", :params [{:name \"id\", :flag :id, :required? true} {:name \"card\", :flag :card, :required? true}], :body {:decision {:flag :decision, :required? true}}, :timeout-seconds 660}]")
+    3 (document-edn-read "[{:command [\"bots\" \"cancel\"], :method :post, :template \"/api/agent-bots/{id}/messages/{run}/cancel\", :params [{:name \"id\", :flag :id, :required? true} {:name \"run\", :flag :run, :required? true}]} {:command [\"bots\" \"rename\"], :method :post, :template \"/api/agent-bots/{id}/name\", :params [{:name \"id\", :flag :id, :required? true}], :body {:name {:flag :name}, :by {:flag :by}, :restore {:flag :restore, :parse :boolish}}} {:command [\"bots\" \"trajectory\"], :method :get, :template \"/api/agent-bots/{id}/runs/{run}/trajectory\", :params [{:name \"id\", :flag :id, :required? true} {:name \"run\", :flag :run, :required? true}]} {:command [\"itonami\" \"profile\" \"list\"], :method :get, :template \"/api/profiles\"} {:command [\"itonami\" \"session\" \"list\"], :method :get, :template \"/p/{profile}/api/sessions\", :params [{:name \"profile\", :flag :profile, :default \"default\"}]} {:command [\"itonami\" \"session\" \"messages\"], :method :get, :template \"/p/{profile}/api/sessions/{session}/messages\", :params [{:name \"profile\", :flag :profile, :default \"default\"} {:name \"session\", :flag :session, :required? true}]} {:command [\"itonami\" \"run\"], :method :post, :template \"/p/{profile}/v1/runs\", :params [{:name \"profile\", :flag :profile, :default \"default\"}], :body {:input {:flag :input, :required? true}, :instructions {:flag :instructions}, :goal {:flag :goal, :parse :boolish}}} {:command [\"itonami\" \"run-status\"], :method :get, :template \"/v1/runs/{run}\", :params [{:name \"run\", :flag :run, :required? true}]}]")
+    4 (document-edn-read "[{:command [\"itonami\" \"steer\"], :method :post, :template \"/v1/runs/{run}/steer\", :params [{:name \"run\", :flag :run, :required? true}], :body {:input {:flag :input, :required? true}}} {:command [\"itonami\" \"stop\"], :method :post, :template \"/v1/runs/{run}/stop\", :params [{:name \"run\", :flag :run, :required? true}]} {:command [\"itonami\" \"approve\"], :method :post, :template \"/v1/runs/{run}/approval\", :params [{:name \"run\", :flag :run, :required? true}], :body {:choice {:flag :choice, :default \"once\"}}}]")
+    (document-null)))
+
+(defn alias-chunk [c :i64] :document
+  (case (quot c 16)
+    0 (alias-chunk-c0 c)
+    (document-null)))
+
+(defn host-side-count [] :i64 3)
+(defn- host-side-chunks [] :i64 1)
+
+(defn- host-side-chunk-c0 [c :i64] :document
+  (case c
+    0 (document-edn-read "[{:command [\"bots\" \"hygiene\"], :why \"reads west metadata on this machine; there is no route to call\"} {:command [\"bots\" \"refactor\" \"scan\"], :why \"west refactor scan is host-side\"} {:command [\"bots\" \"refactor\" \"inspect\"], :why \"west refactor inspect is host-side\"}]")
+    (document-null)))
+
+(defn host-side-chunk [c :i64] :document
+  (case (quot c 16)
+    0 (host-side-chunk-c0 c)
+    (document-null)))
+
+
+;; ---------------------------------------------------------------------------
+;; tables: chunks of eight commands, each one EDN document
+;;
+;; `table` selects which generated table answers: 0 registry, 1 aliases,
+;; 2 host-side. A closure would do the same with one fewer parameter and one
+;; more dispatch; a small integer is the plainer of the two.
+;; ---------------------------------------------------------------------------
+
+(defn- table-count [table :i64] :i64
+  (case table 0 (registry-count) 1 (alias-count) 2 (host-side-count) 0))
+
+(defn- table-chunks [table :i64] :i64
+  (case table 0 (registry-chunks) 1 (alias-chunks) 2 (host-side-chunks) 0))
+
+(defn- table-chunk [table :i64 c :i64] :document
+  (case table 0 (registry-chunk c) 1 (alias-chunk c) 2 (host-side-chunk c) (document-null)))
+
+(defn- table-at [table :i64 i :i64] :document
+  (at-or-null (table-chunk table (quot i 8)) (mod i 8)))
+
+(defn registry-at [i :i64] :document (table-at 0 i))
+(defn alias-at [i :i64] :document (table-at 1 i))
+(defn host-side-at [i :i64] :document (table-at 2 i))
+
+(defn- command-words [command :document] :document (get-or-null command :command))
+
+(defn- prefix-of? [cmd-words :document ws :document j :i64] :bool
+  (if (>= j (document-count cmd-words))
+    true
+    (if (string=? (str-at cmd-words j) (str-at ws j))
+      (prefix-of? cmd-words ws (+ j 1))
+      false)))
+
+;; the index of the longest command in `table` whose words prefix `ws`, or -1.
+;; Longest wins because `workspace drive documents` and `workspace drive
+;; documents rename` are both commands. Ties keep the earlier entry, as the
+;; oracle's stable sort did. Walked chunk by chunk so each chunk is read once.
+;;
+;; The running best is one integer, `index * 8 + arity` (arity < 8, -1 for
+;; none): a function takes at most five parameters here, and the pair would
+;; have been the sixth.
+(defn- best-index [packed :i64] :i64 (if (< packed 0) -1 (quot packed 8)))
+(defn- best-arity [packed :i64] :i64 (if (< packed 0) 0 (mod packed 8)))
+
+(defn- longest-in-chunk [chunk :document ws :document base :i64 k :i64 packed :i64] :i64
+  (if (>= k (document-count chunk))
+    packed
+    (let [cw (command-words (at-or-null chunk k))
+          arity (document-count cw)]
+      (if (and (<= arity (document-count ws))
+               (> arity (best-arity packed))
+               (prefix-of? cw ws 0))
+        (longest-in-chunk chunk ws base (+ k 1) (+ (* (+ base k) 8) arity))
+        (longest-in-chunk chunk ws base (+ k 1) packed)))))
+
+(defn- longest-from [table :i64 ws :document c :i64 packed :i64] :i64
+  (if (>= c (table-chunks table))
+    (best-index packed)
+    (longest-from table ws (+ c 1)
+                  (longest-in-chunk (table-chunk table c) ws (* c 8) 0 packed))))
+
+(defn- longest-in [table :i64 ws :document] :i64
+  (longest-from table ws 0 -1))
+
+(defn- rest-from [ws :document i :i64 acc :document] :document
+  (if (>= i (document-count ws))
+    acc
+    (rest-from ws (+ i 1) (document-vector-conj acc (at-or-null ws i)))))
+
+(defn- registry-arity [i :i64] :i64 (document-count (command-words (registry-at i))))
+
+;; `{:command … :rest …}` for these words, or `{}`.
+(defn resolve-command [ws :document] :document
+  (let [i (longest-in 0 ws)]
+    (if (< i 0)
+      (document-map)
+      (document-assoc (document-assoc (document-map) :command (registry-at i))
+                      :rest (rest-from ws (registry-arity i) (document-vector))))))
+
+;; the alias these words name, or null
+(defn resolve-alias [ws :document] :document
+  (let [i (longest-in 1 ws)]
+    (if (< i 0) (document-null) (alias-at i))))
+
+;; the host-side command these words name, or null. Named separately so a
+;; front end can refuse `bots hygiene` as "this one does not go through the
+;; server" rather than as "no such command".
+(defn host-side [ws :document] :document
+  (let [i (longest-in 2 ws)]
+    (if (< i 0) (document-null) (host-side-at i))))
+
+;; What these argv words mean, as data. Aliases win over the generated
+;; registry; `:host-side` and `:unknown` are distinct outcomes.
+(defn resolve-invocation [argv :document] :document
+  (let [ws (words argv)
+        flags (parse-flags argv)
+        base (document-assoc (document-assoc (document-map) :flags flags) :words ws)
+        a (longest-in 1 ws)]
+    (if (>= a 0)
+      (document-assoc (document-assoc base :kind (document-keyword :alias)) :command (alias-at a))
+      (let [h (longest-in 2 ws)]
+        (if (>= h 0)
+          (document-assoc (document-assoc base :kind (document-keyword :host-side)) :command (host-side-at h))
+          (let [c (longest-in 0 ws)]
+            (if (>= c 0)
+              (document-assoc
+               (document-assoc
+                (document-assoc base :kind (document-keyword :registry))
+                :command (registry-at c))
+               :rest (rest-from ws (registry-arity c) (document-vector)))
+              (document-assoc base :kind (document-keyword :unknown)))))))))
+
+;; ---------------------------------------------------------------------------
+;; names, usage, search
+;; ---------------------------------------------------------------------------
+
+(defn- join-from [v :document sep :string i :i64 acc :string] :string
+  (if (>= i (document-count v))
+    acc
+    (join-from v sep (+ i 1)
+               (if (= i 0) (str-at v i) (cat3 acc sep (str-at v i))))))
+
+(defn command-name [command :document] :string
+  (join-from (get-or-null command :command) " " 0 ""))
+
+(defn- params-usage [params :document i :i64 acc :string] :string
+  (if (>= i (count-or-zero params))
+    acc
+    (let [nm (get-str (at-or-null params i) :name "")]
+      (params-usage params (+ i 1) (string-concat acc (cat4 " --" nm " <" (string-concat nm ">")))))))
+
+(defn- flags-usage [flags :document i :i64 acc :string] :string
+  (if (>= i (count-or-zero flags))
+    acc
+    (flags-usage flags (+ i 1) (string-concat acc (cat3 " [--" (str-at flags i) " <value>]")))))
+
+;; One line of help for a command: its name, then the flags it is known to take.
+(defn usage [command :document] :string
+  (cat3 (command-name command)
+        (params-usage (get-or-null command :params) 0 "")
+        (flags-usage (get-or-null command :flags) 0 "")))
+
+(defn- blank? [s :string] :bool
+  ;; whitespace-only, as str/blank?: every code point is ASCII space or below
+  (loop [i 0]
+    (if (>= i (string-length s))
+      true
+      (let [cp (string-code-point-at s i)]
+        (if (<= cp 32) (recur (+ i (cp-width cp))) false)))))
+
+(defn- every-term-in? [nm :string terms :document i :i64] :bool
+  (if (>= i (document-count terms))
+    true
+    (let [t (string-fold-case (str-at terms i))]
+      (if (blank? t)
+        (every-term-in? nm terms (+ i 1))
+        (if (string-contains? nm t)
+          (every-term-in? nm terms (+ i 1))
+          false)))))
+
+(defn- matches? [command :document terms :document] :bool
+  (every-term-in? (string-fold-case (command-name command)) terms 0))
+
+(defn- match-count-in-chunk [chunk :document terms :document k :i64 n :i64] :i64
+  (if (>= k (document-count chunk))
+    n
+    (match-count-in-chunk chunk terms (+ k 1) (if (matches? (at-or-null chunk k) terms) (+ n 1) n))))
+
+(defn- match-count-from [terms :document c :i64 n :i64] :i64
+  (if (>= c (registry-chunks))
+    n
+    (match-count-from terms (+ c 1) (match-count-in-chunk (registry-chunk c) terms 0 n))))
+
+;; Commands whose name contains every one of `terms`; empty terms means all.
+;; Answered as a count and an nth because a result list of 211 does not fit a
+;; document; the caller walks 0..count.
+(defn match-count [terms :document] :i64
+  (match-count-from terms 0 0))
+
+;; the `want`-th match, scanning chunk by chunk; `seen` counts matches so far.
+(defn- match-in-chunk [chunk :document terms :document want :i64 k :i64 seen :i64] :i64
+  ;; returns the index within the chunk of the wanted match, or -(seen+1) to
+  ;; carry the running count out (a document cannot be returned alongside it)
+  (if (>= k (document-count chunk))
+    (- 0 (+ seen 1))
+    (if (matches? (at-or-null chunk k) terms)
+      (if (= seen want) k (match-in-chunk chunk terms want (+ k 1) (+ seen 1)))
+      (match-in-chunk chunk terms want (+ k 1) seen))))
+
+(defn- match-at-from [terms :document want :i64 c :i64 seen :i64] :document
+  (if (>= c (registry-chunks))
+    (document-null)
+    (let [chunk (registry-chunk c)
+          r (match-in-chunk chunk terms want 0 seen)]
+      (if (>= r 0)
+        (at-or-null chunk r)
+        (match-at-from terms want (+ c 1) (- 0 (+ r 1)))))))
+
+(defn match-at [terms :document nth :i64] :document
+  (match-at-from terms nth 0 0))
+
+;; ---------------------------------------------------------------------------
+;; the HTTP request one invocation means
+;; ---------------------------------------------------------------------------
+
+(defn- error-doc [type :keyword message :string] :document
+  (document-assoc (document-map) :error
+                  (document-assoc (document-assoc (document-map) :type (document-keyword type))
+                                  :message (document-string message))))
+
+(defn- error-with [type :keyword message :string k :keyword v :document] :document
+  (let [e (error-doc type message)]
+    (document-assoc e :error (document-assoc (get-or-null e :error) k v))))
+
+(defn- str-key [k :string] :document (document-string k))
+
+(defn- get-by-str [d :document k :string] :document
+  (option-or (document-get d (str-key k)) (document-null)))
+
+;; `arguments` is keyed by STRING (the front end merges named flags,
+;; positional arguments and the payload under the parameter's own name).
+(defn- fill-template [template :string params :document args :document i :i64] :document
+  ;; returns {:path … :remaining …} or {:error …}
+  (if (>= i (document-count params))
+    (document-assoc (document-assoc (document-map) :path (document-string template)) :remaining args)
+    (let [nm (get-str (at-or-null params i) :name "")
+          v (get-by-str args nm)]
+      (if (present? v)
+        (fill-template (string-replace-all template (cat3 "{" nm "}") (url-encode (value-text v)))
+                       params (document-dissoc args (str-key nm)) (+ i 1))
+        (error-with :commands/missing-parameter
+                    (cat4 "--" nm " が必要です（" (string-concat template "）"))
+                    :parameter (document-string nm))))))
+
+(defn- query-from [m :document i :i64 acc :string] :string
+  (if (>= i (document-count m))
+    acc
+    (let [e (entry-at m i)
+          k (value-text (at-or-null e 0))
+          v (value-text (at-or-null e 1))
+          pair (cat3 (url-encode k) "=" (url-encode v))]
+      (query-from m (+ i 1) (if (= i 0) pair (cat3 acc "&" pair))))))
+
+;; the string-keyed remainder as the keyword-keyed JSON body the server reads
+(defn- keywordize [m :document i :i64 acc :document] :document
+  (if (>= i (document-count m))
+    acc
+    (let [e (entry-at m i)]
+      (keywordize m (+ i 1)
+                  (document-assoc acc (keyword-from-string (value-text (at-or-null e 0))) (at-or-null e 1))))))
+
+;; Path parameters come out of `arguments` by name; everything left over is
+;; the query string for a read and the JSON body for a write.
+(defn request [command :document arguments :document body-override :document] :document
+  (let [method (get-str command :method "GET")
+        filled (fill-template (get-str command :template "") (get-or-null command :params) arguments 0)]
+    (if (present? (get-or-null filled :error))
+      filled
+      (let [path (get-str filled :path "")
+            remaining (get-or-null filled :remaining)
+            read? (string=? method "GET")
+            out (document-assoc (document-map) :method
+                                (document-keyword (keyword-from-string (string-fold-case method))))]
+        (if read?
+          (document-assoc
+           (document-assoc out :path
+                           (document-string (if (> (document-count remaining) 0)
+                                              (cat3 path "?" (query-from remaining 0 ""))
+                                              path)))
+           :body (document-null))
+          (document-assoc (document-assoc out :path (document-string path))
+                          :body (document-merge (keywordize remaining 0 (document-map)) body-override)))))))
+
+;; ---------------------------------------------------------------------------
+;; alias requests — the reviewed table's body specs
+;; ---------------------------------------------------------------------------
+
+(defn- spec? [d :document] :bool
+  (if (= :map (document-kind d))
+    (if (document-contains d :flag) true (document-contains d :enrollment-key))
+    false))
+
+(defn- space-byte? [cp :i64] :bool (<= cp 32))
+
+;; byte offset of the first non-space code point at or after `i`
+(defn- left-edge [s :string i :i64] :i64
+  (if (>= i (string-length s))
+    i
+    (let [cp (string-code-point-at s i)]
+      (if (space-byte? cp) (left-edge s (+ i (cp-width cp))) i))))
+
+;; byte offset just past the last non-space code point, scanning forward
+(defn- right-edge [s :string i :i64 last-end :i64] :i64
+  (if (>= i (string-length s))
+    last-end
+    (let [cp (string-code-point-at s i)
+          next (+ i (cp-width cp))]
+      (right-edge s next (if (space-byte? cp) last-end next)))))
+
+(defn- trim [s :string] :string
+  ;; ASCII whitespace at both ends, which is what the comma-list parse trimmed.
+  (let [a (left-edge s 0)
+        b (right-edge s a a)]
+    (string-substring s a b)))
+
+;; `string-index-of` is not qualified on wasm32 (measured 2026-09-15), so the
+;; comma is found by code point.
+(defn- index-of-cp [s :string cp :i64 i :i64] :i64
+  (if (>= i (string-length s))
+    -1
+    (let [here (string-code-point-at s i)]
+      (if (= cp here) i (index-of-cp s cp (+ i (cp-width here)))))))
+
+(defn- comma-list-from [s :string acc :document] :document
+  (let [i (index-of-cp s 44 0)]
+    (if (< i 0)
+      (let [t (trim s)]
+        (if (blank? t) acc (document-vector-conj acc (document-string t))))
+      (let [t (trim (string-substring s 0 i))]
+        (comma-list-from (string-substring s (+ i 1) (string-length s))
+                         (if (blank? t) acc (document-vector-conj acc (document-string t))))))))
+
+(defn- digits-from [s :string i :i64 acc :i64] :i64
+  (if (>= i (string-length s))
+    acc
+    (let [cp (string-code-point-at s i)]
+      (if (and (>= cp 48) (<= cp 57))
+        (digits-from s (+ i 1) (+ (* acc 10) (- cp 48)))
+        -1))))   ; a non-digit code point ends the parse; its width does not matter
+
+;; `parse-long` on a string of digits with an optional leading `-`; anything
+;; else is null, as `parse-long` returned nil.
+(defn- parse-long-doc [s :string] :document
+  (if (blank? s)
+    (document-null)
+    (if (= 45 (string-code-point-at s 0))
+      (let [n (digits-from s 1 0)] (if (< n 0) (document-null) (document-i64 (- 0 n))))
+      (let [n (digits-from s 0 0)] (if (< n 0) (document-null) (document-i64 n))))))
+
+(defn- boolish? [raw :document] :bool
+  (cond
+    (truthy-flag? raw) true
+    (= :string (document-kind raw))
+    (let [s (str-or raw "")]
+      (cond (string=? s "true") true (string=? s "1") true (string=? s "yes") true :else false))
+    :else false))
+
+;; the value a body leaf takes, `{:needs …}` when it takes an effect the host
+;; has not supplied, or null for absent. `supplied` is
+;; `{:file-contents {"<path>" "<text>"} :enrollment-key "<key>"}`.
+(defn- coerce [raw :document parse :keyword supplied :document] :document
+  (cond
+    (= parse :none) raw
+    (= parse :long) (parse-long-doc (value-text raw))
+    (= parse :comma-list) (if (= :string (document-kind raw))
+                            (comma-list-from (str-or raw "") (document-vector))
+                            (document-null))
+    (= parse :boolish) (document-bool (boolish? raw))
+    (= parse :file-contents)
+    (let [path (value-text raw)
+          files (get-or-null supplied :file-contents)
+          text (if (= :map (document-kind files))
+                 (option-or (document-get files (document-string path)) (document-null))
+                 (document-null))]
+      (if (present? text)
+        text
+        (document-assoc (document-map) :needs
+                        (document-assoc (document-map) :read-file (document-string path)))))
+    :else (document-assoc (document-map) :needs
+                          (document-assoc (document-map) :unknown-parse (document-keyword parse)))))
+
+(defn- needs? [d :document] :bool
+  (if (= :map (document-kind d)) (document-contains d :needs) false))
+
+(defn- leaf-value [flags :document spec :document supplied :document] :document
+  ;; a spec leaf: {:flag k :required? bool :default x :parse p} or {:enrollment-key true}
+  (if (document-contains spec :enrollment-key)
+    (let [key (get-or-null supplied :enrollment-key)]
+      (if (present? key)
+        key
+        (document-assoc (document-map) :needs (document-keyword :enrollment-key))))
+    (let [flag (kw-or (get-or-null spec :flag) :none)
+          raw (let [v (get-or-null flags flag)]
+                (if (present? v) v (get-or-null spec :default)))
+          required? (option-or (document-bool-value (get-or-null spec :required?)) false)]
+      (if (present? raw)
+        (coerce raw (kw-or (get-or-null spec :parse) :none) supplied)
+        (if required?
+          (error-with :commands/missing-argument
+                      (cat3 "--" (keyword-name flag) " が必要です")
+                      :flag (document-keyword flag))
+          (document-null))))))
+
+;; A nested body object is built key by key; a leaf that is absent drops its
+;; key, and an object whose every leaf was absent drops itself, because the
+;; server reads a present-but-empty key as an instruction.
+(defn- build-body [flags :document spec :document supplied :document i :i64 acc :document] :document
+  (if (>= i (document-count spec))
+    acc
+    (let [e (entry-at spec i)
+          k (kw-or (at-or-null e 0) :none)
+          sub (at-or-null e 1)
+          v (if (spec? sub)
+              (leaf-value flags sub supplied)
+              (let [nested (build-body flags sub supplied 0 (document-map))]
+                (if (present? (get-or-null nested :error))
+                  nested
+                  (if (needs? nested)
+                    nested
+                    (if (> (document-count nested) 0) nested (document-null))))))]
+      (cond
+        (not (present? v)) (build-body flags spec supplied (+ i 1) acc)
+        (= :map (document-kind v))
+        (if (document-contains v :error)
+          v
+          (if (document-contains v :needs)
+            v
+            (build-body flags spec supplied (+ i 1) (document-assoc acc k v))))
+        :else (build-body flags spec supplied (+ i 1) (document-assoc acc k v))))))
+
+(defn- alias-path [template :string params :document flags :document i :i64] :document
+  ;; {:path …} or {:error …}; an alias without :params has none to fill
+  (if (>= i (count-or-zero params))
+    (document-assoc (document-map) :path (document-string template))
+    (let [p (at-or-null params i)
+          nm (get-str p :name "")
+          flag (kw-or (get-or-null p :flag) :none)
+          v (let [x (get-or-null flags flag)] (if (present? x) x (get-or-null p :default)))
+          required? (option-or (document-bool-value (get-or-null p :required?)) false)
+          hint (get-or-null p :hint)]
+      (if (present? v)
+        (alias-path (string-replace-all template (cat3 "{" nm "}") (url-encode (value-text v)))
+                    params flags (+ i 1))
+        (error-with :commands/missing-argument
+                    (if (and required? (present? hint))
+                      (cat4 "--" (keyword-name flag) " が必要です（" (string-concat (str-or hint "") "）"))
+                      (cat3 "--" (keyword-name flag) " が必要です"))
+                    :flag (document-keyword flag))))))
+
+(defn- one-of-present? [built :document keys :document i :i64] :bool
+  (if (>= i (document-count keys))
+    false
+    (if (document-contains built (kw-or (at-or-null keys i) :none))
+      true
+      (one-of-present? built keys (+ i 1)))))
+
+(defn- one-of-names [keys :document i :i64 acc :string] :string
+  (if (>= i (document-count keys))
+    acc
+    (let [nm (string-concat "--" (keyword-name (kw-or (at-or-null keys i) :none)))]
+      (one-of-names keys (+ i 1) (if (= i 0) nm (cat3 acc " / " nm))))))
+
+;; The HTTP request one alias invocation means, `{:needs …}` when it needs a
+;; file's contents or the enrollment key the host has not supplied yet, or
+;; `{:error …}` naming the flag.
+(defn alias-request [alias :document flags :document supplied :document] :document
+  (let [pathed (alias-path (get-str alias :template "") (get-or-null alias :params) flags 0)]
+    (if (present? (get-or-null pathed :error))
+      pathed
+      (let [body-spec (get-or-null alias :body)
+            built (if (= :map (document-kind body-spec))
+                    (build-body flags body-spec supplied 0 (document-map))
+                    (document-map))]
+        (cond
+          (present? (get-or-null built :error)) built
+          (needs? built) built
+          :else
+          (let [requires (get-or-null alias :requires-one-of)
+                method (kw-or (get-or-null alias :method) :get)
+                timeout (get-or-null alias :timeout-seconds)]
+            (if (and (= :vector (document-kind requires))
+                     (> (document-count requires) 0)
+                     (not (one-of-present? built requires 0)))
+              (error-with :commands/missing-argument
+                          (string-concat "次のいずれかを指定してください: " (one-of-names requires 0 ""))
+                          :requires-one-of requires)
+              (let [base (document-assoc (document-assoc (document-map) :method (document-keyword method))
+                                         :path (get-or-null pathed :path))
+                    with-body (if (= method :post) (document-assoc base :body built) base)]
+                (if (present? timeout) (document-assoc with-body :timeout-seconds timeout) with-body)))))))))
+
+;; ---------------------------------------------------------------------------
+;; tests — run by `amu test`, on every backend it hosts
+;; ---------------------------------------------------------------------------
+
+(defn- argv [text :string] :document (document-edn-read text))
+
+(defn test-words [] :bool
+  (let [ws (words (argv "[\"bots\" \"--label\" \"claude-code\" \"task\" \"--x\"]"))]
+    (and (= 2 (document-count ws)) (string=? (str-at ws 1) "task"))))
+
+(defn test-flags [] :bool
+  (let [f (parse-flags (argv "[\"bots\" \"--label\" \"cli\" \"--dry\" \"--id\" \"7\"]"))]
+    (and (string=? (get-str f :label "") "cli")
+         (truthy-flag? (get-or-null f :dry))
+         (string=? (get-str f :id "") "7"))))
+
+(defn test-longest-wins [] :bool
+  ;; `workspace drive documents rename` must beat `workspace drive documents`
+  (let [r (resolve-command (argv "[\"workspace\" \"drive\" \"documents\" \"rename\" \"doc-1\"]"))]
+    (and (= 4 (document-count (get-or-null (get-or-null r :command) :command)))
+         (= 1 (document-count (get-or-null r :rest))))))
+
+(defn test-alias-shadows-registry [] :bool
+  (= :alias (kw-or (get-or-null (resolve-invocation (argv "[\"business\" \"list\"]")) :kind) :none)))
+
+(defn test-host-side-is-named [] :bool
+  (= :host-side (kw-or (get-or-null (resolve-invocation (argv "[\"bots\" \"hygiene\"]")) :kind) :none)))
+
+(defn test-unknown [] :bool
+  (= :unknown (kw-or (get-or-null (resolve-invocation (argv "[\"no\" \"such\" \"thing\"]")) :kind) :none)))
+
+(defn test-request-get [] :bool
+  (let [r (resolve-invocation (argv "[\"session\" \"--project\" \"p 1\"]"))
+        req (request (get-or-null r :command) (document {"project" "p 1"}) (document-map))]
+    (and (= :get (kw-or (get-or-null req :method) :none))
+         (string=? (get-str req :path "") "/api/session?project=p+1"))))
+
+(defn test-request-post [] :bool
+  (let [cmd (document {:command ["x"] :method "POST" :template "/api/x/{id}" :params [{:name "id"}] :flags []})
+        req (request cmd (document {"id" "a/b" "note" "n"}) (document {:extra 1}))]
+    (and (string=? (get-str req :path "") "/api/x/a%2Fb")
+         (= :post (kw-or (get-or-null req :method) :none))
+         (string=? (get-str (get-or-null req :body) :note "") "n")
+         (= 1 (option-or (document-i64-value (get-or-null (get-or-null req :body) :extra)) 0)))))
+
+(defn test-request-missing-parameter [] :bool
+  (let [cmd (document {:command ["x"] :method "GET" :template "/api/x/{id}" :params [{:name "id"}] :flags []})
+        req (request cmd (document-map) (document-map))]
+    (= :commands/missing-parameter (kw-or (get-or-null (get-or-null req :error) :type) :none))))
+
+(defn- sample-alias [] :document
+  (document {:command ["bots" "task"] :method :post :template "/api/agent-bots/{id}/task"
+             :params [{:name "id" :flag :id :required? true :hint "bots list で確認"}]
+             :body {:text {:flag :text :required? true}
+                    :n {:flag :n :parse :long}
+                    :tags {:flag :tags :parse :comma-list}
+                    :dry {:flag :dry :parse :boolish}
+                    :meta {:label {:flag :label} :prompt {:flag :prompt-file :parse :file-contents}}}
+             :timeout-seconds 120}))
+
+(defn test-alias-request [] :bool
+  (let [flags (parse-flags (argv "[\"--id\" \"b 1\" \"--text\" \"hi\" \"--n\" \"12\" \"--tags\" \"a, b,,c\" \"--dry\" \"--label\" \"L\"]"))
+        r (alias-request (sample-alias) flags (document-map))
+        body (get-or-null r :body)]
+    (and (string=? (get-str r :path "") "/api/agent-bots/b+1/task")
+         (= :post (kw-or (get-or-null r :method) :none))
+         (= 120 (option-or (document-i64-value (get-or-null r :timeout-seconds)) 0))
+         (string=? (get-str body :text "") "hi")
+         (= 12 (option-or (document-i64-value (get-or-null body :n)) 0))
+         (= 3 (document-count (get-or-null body :tags)))
+         (option-or (document-bool-value (get-or-null body :dry)) false)
+         (string=? (get-str (get-or-null body :meta) :label "") "L"))))
+
+(defn test-alias-needs [] :bool
+  (let [flags (parse-flags (argv "[\"--id\" \"b\" \"--text\" \"hi\" \"--prompt-file\" \"p.txt\"]"))
+        r (alias-request (sample-alias) flags (document-map))
+        again (alias-request (sample-alias) flags (document {:file-contents {"p.txt" "PROMPT"}}))]
+    (and (string=? (get-str (get-or-null r :needs) :read-file "") "p.txt")
+         (string=? (get-str (get-or-null (get-or-null again :body) :meta) :prompt "") "PROMPT"))))
+
+(defn test-alias-required [] :bool
+  (let [r (alias-request (sample-alias) (parse-flags (argv "[\"--text\" \"hi\"]")) (document-map))
+        e (get-or-null r :error)]
+    (and (= :commands/missing-argument (kw-or (get-or-null e :type) :none))
+         (= :id (kw-or (get-or-null e :flag) :none))
+         (string-contains? (get-str e :message "") "bots list で確認"))))
+
+(defn test-usage [] :bool
+  (string=? (usage (document {:command ["x" "y"] :params [{:name "id"}] :flags ["q"]}))
+            "x y --id <id> [--q <value>]"))
+
+(defn test-match [] :bool
+  (let [all (match-count (document-vector))
+        some (match-count (argv "[\"BOTS\"]"))]
+    (and (= all (registry-count))
+         (> some 0)
+         (< some all)
+         (string-contains? (string-fold-case (command-name (match-at (argv "[\"bots\"]") 0))) "bots"))))
+
+(defn test-url-encode [] :bool
+  (and (string=? (url-encode "a b/c?d=é*") "a+b%2Fc%3Fd%3D%C3%A9*")
+       (string=? (url-encode "日本") "%E6%97%A5%E6%9C%AC")))
+
+(defn test-comma-list [] :bool
+  (= 2 (document-count (comma-list-from " a ,, b" (document-vector)))))
+
+(defn test-boolish [] :bool
+  (and (boolish? (document-string "yes")) (not (boolish? (document-string "no"))) (boolish? (document-bool true))))
+
+(defn test-long [] :bool
+  (and (= 42 (option-or (document-i64-value (parse-long-doc "42")) 0))
+       (= -7 (option-or (document-i64-value (parse-long-doc "-7")) 0))
+       (not (present? (parse-long-doc "4x")))))

@@ -1,0 +1,529 @@
+;; cloud.itonami.repo-profile — a profile a repository carries:
+;; `<repo root>/.itonami/profile.edn`, or one file per profile under
+;; `.itonami/profiles/`. The Kotoba component that replaces
+;; `cloud.itonami.app.repo-profile` (src/cloud/itonami/app/repo_profile.cljk
+;; stays as the oracle until every consumer has cut over; parity harness:
+;; test/kotoba_parity_nbb.cljk).
+;;
+;; Pure: handed the text of a file, returns either an accepted profile or a
+;; refusal that names why. Finding the file is the host's effect; deciding
+;; what it means is here.
+;;
+;; ## A repo file is observed content
+;;
+;; Whoever can push to a repository can write this file. So it DESCRIBES and
+;; never GRANTS, enforced by a closed vocabulary: `describes` crosses as
+;; written, `prefers` crosses but takes effect only where the destination
+;; admits it, and everything else is refused by name.
+;;
+;; ## Where the reader's traps go
+;;
+;; `document-edn-read` is the host's bounded EDN reader. On malformed text or
+;; a dispatch form (`#inst`, `#uuid`, any tag) it traps instead of returning,
+;; and a trap is not a value this component can branch on (`try` lowers on
+;; the KIR interpreter only). So the HOST catches the trap and calls
+;; `unreadable` with the reader's message; the classification -- tagged
+;; literal or unreadable -- is decided here from that message, not in the
+;; host. The same reader bounds a profile to 256 nodes / 32 items per
+;; collection / depth 8 (`lang/guest-grammar.edn` `:sugar :document`), which
+;; the oracle did not; a profile past those reads as
+;; `:repo-profile/unreadable` naming the limit. Declared-temporary: it moves
+;; when the document bound does.
+;;
+;; A profile longer than `max-bytes` (65536) never reaches `admit`: 65536 is
+;; also the host's typed-string bound, so the host traps `typed string is
+;; oversized` on the way in and `unreadable` turns that into
+;; `:repo-profile/too-large`. The guard inside `admit` stays as the statement
+;; of the limit.
+;;
+;; `string-length` is a UTF-8 byte count on every backend (measured
+;; 2026-09-15); the oracle's `count` counts UTF-16 units. The three length
+;; limits are therefore measured in code points here (`code-points`), which
+;; agrees with the oracle for every character outside the astral plane.
+
+(ns cloud.itonami.repo-profile
+  (:export [main read-edn schema dir-name file-name max-name max-brief max-id max-bytes
+            describes? cli-config-key? prefers?
+            unreadable admit admit-all-fold select
+            test-accepts test-refuses-key test-schema test-id-missing test-id-too-long
+            test-name-blank test-name-too-long test-brief-too-long test-cli-config
+            test-cli-config-key-refused test-not-a-map test-too-large test-unreadable
+            test-tagged test-fold test-select-requested test-select-for
+            test-select-default test-select-single test-select-ambiguous
+            test-select-none]))
+
+(defn main [] :i64 1)
+
+;; The host's way in for `select`'s arguments: EDN text -> document, in the
+;; reader's canonical order.
+(defn read-edn [text :string] :document (document-edn-read text))
+
+(defn schema [] :string "cloud.itonami.app.repo-profile.v1")
+
+;; Where a repository keeps profiles when it has more than one: one file per
+;; profile, so two people editing their own never conflict on each other's
+;; lines.
+(defn dir-name [] :string ".itonami/profiles")
+
+;; The single-profile file, read as one entry in the same set as anything
+;; under `dir-name`. `.itonami/` is shared with the application, which writes
+;; `workspace.edn` and never `profile.edn`.
+(defn file-name [] :string ".itonami/profile.edn")
+
+(defn max-name [] :i64 60)
+(defn max-brief [] :i64 2000)
+(defn max-id [] :i64 120)
+;; The largest profile this will read; a file from a repository is a file
+;; someone else can make arbitrarily large.
+(defn max-bytes [] :i64 65536)
+
+;; Keys that cross to the destination as written. `:profile/for` is a LABEL:
+;; it says "if you call yourself jun, this is for you", matched against an
+;; identity the DESTINATION configured, never anything the repository supplies.
+(defn describes? [k :keyword] :bool
+  (cond
+    (= k :profile/schema) true (= k :profile/id) true (= k :profile/for) true
+    (= k :profile/default?) true
+    (= k :bot/name) true (= k :bot/brief) true (= k :bot/avatar) true
+    (= k :bot/context-refs) true (= k :bot/tools-requested) true
+    :else false))
+
+;; The `:cli/config` keys a repository may set, and the only ones: `:skin`,
+;; because the theme is the only layer that reads configuration a repository
+;; could reasonably name. `:server` reaching the config plugin would let a
+;; repository choose the ingress the CLI talks to.
+(defn cli-config-key? [k :keyword] :bool (= k :skin))
+
+;; Keys that cross but only take effect if the destination admits them.
+(defn prefers? [k :keyword] :bool
+  (cond (= k :bot/model-preference) true (= k :cli/config) true :else false))
+
+;; ---------------------------------------------------------------------------
+;; helpers
+;; ---------------------------------------------------------------------------
+
+(defn- cat3 [a :string b :string c :string] :string (string-concat a (string-concat b c)))
+
+(defn- get-or-null [d :document k :keyword] :document
+  (option-or (document-get d k) (document-null)))
+
+(defn- present? [d :document] :bool (not (= :null (document-kind d))))
+
+(defn- str-or [d :document fallback :string] :string
+  (option-or (document-string-value d) fallback))
+
+(defn- entry-at [m :document i :i64] :document
+  (option-or (document-map-entry-at m i) (document-null)))
+
+(defn- at-or-null [v :document i :i64] :document
+  (option-or (document-vector-at v i) (document-null)))
+
+(defn- entry-key [e :document] :keyword
+  (option-or (document-keyword-value (at-or-null e 0)) :none))
+
+(defn- cp-width [cp :i64] :i64
+  (cond (< cp 128) 1 (< cp 2048) 2 (< cp 65536) 3 :else 4))
+
+(defn- code-points-from [s :string i :i64 n :i64] :i64
+  (if (>= i (string-length s))
+    n
+    (code-points-from s (+ i (cp-width (string-code-point-at s i))) (+ n 1))))
+
+(defn- code-points [s :string] :i64 (code-points-from s 0 0))
+
+;; `pr-str` of a keyword: `:ns/name` -- keyword-name drops the namespace and
+;; a namespaced keyword's namespace is not readable here, so the printer is
+;; the document printer, which prints EDN.
+(defn- pr-keyword [k :keyword] :string
+  (document-edn-print (document-keyword k)))
+
+(defn- blank? [s :string] :bool
+  ;; whitespace-only, by code point; the oracle used str/blank?
+  (loop [i 0]
+    (if (>= i (string-length s))
+      true
+      (let [cp (string-code-point-at s i)]
+        (if (<= cp 32) (recur (+ i (cp-width cp))) false)))))
+
+(defn- blank-string? [d :document] :bool
+  (if (= :string (document-kind d)) (blank? (str-or d "")) true))
+
+(defn- refusal [reason :keyword message :string] :document
+  (document-assoc
+   (document-assoc
+    (document-assoc (document-assoc (document-map) :schema (document-string (schema)))
+                    :accepted? (document-bool false))
+    :reason (document-keyword reason))
+   :message (document-string message)))
+
+(defn- refusal-with [reason :keyword message :string k :keyword v :document] :document
+  (document-assoc (refusal reason message) k v))
+
+(defn- refused? [d :document] :bool
+  (if (= :map (document-kind d))
+    (let [a (get-or-null d :accepted?)]
+      (if (= :bool (document-kind a)) (not (option-or (document-bool-value a) true)) false))
+    false))
+
+;; ---------------------------------------------------------------------------
+;; parse
+;; ---------------------------------------------------------------------------
+
+;; The host catches the reader's trap and hands its message here. A dispatch
+;; form is the reader's own name for a tagged literal.
+(defn unreadable [message :string] :document
+  (cond
+    (string-contains? message "dispatch forms are forbidden")
+    (refusal :repo-profile/tagged-literal
+             (cat3 (file-name) " に tagged literal（`#inst` `#uuid` など）があります。"
+                   "値は EDN のスカラーとコレクションだけにしてください。"))
+    ;; the host's string bound is max-bytes; text past it never arrives here
+    (string-contains? message "oversized")
+    (refusal :repo-profile/too-large (cat3 (file-name) " が大きすぎます（上限 65536 bytes）。" ""))
+    :else
+    (refusal :repo-profile/unreadable
+             (cat3 (file-name) " を読めませんでした: " message))))
+
+;; Keys of `m` that are neither described nor preferred, sorted as the
+;; document keeps them (canonical), space-joined with pr-str -- and as a
+;; vector for the data.
+(defn- refused-keys [m :document i :i64 acc :document] :document
+  (if (>= i (document-count m))
+    acc
+    (let [k (entry-key (entry-at m i))]
+      (refused-keys m (+ i 1)
+                    (if (or (describes? k) (prefers? k))
+                      acc
+                      (document-vector-conj acc (document-keyword k)))))))
+
+(defn- join-keywords [v :document i :i64 acc :string] :string
+  (if (>= i (document-count v))
+    acc
+    (let [s (pr-keyword (option-or (document-keyword-value (at-or-null v i)) :none))]
+      (join-keywords v (+ i 1) (if (= i 0) s (cat3 acc " " s))))))
+
+(defn- extra-cli-keys [cfg :document i :i64 acc :document] :document
+  (if (>= i (document-count cfg))
+    acc
+    (let [k (entry-key (entry-at cfg i))]
+      (extra-cli-keys cfg (+ i 1)
+                      (if (cli-config-key? k) acc (document-vector-conj acc (document-keyword k)))))))
+
+(defn- text-length [d :document] :i64
+  ;; `(count (str v))` for the brief: a non-string value's printed form
+  (if (= :string (document-kind d))
+    (code-points (str-or d ""))
+    (code-points (document-edn-print d))))
+
+(defn- validate-values [m :document] :document
+  ;; null when the values are fine, else a refusal
+  (let [sch (get-or-null m :profile/schema)
+        id (get-or-null m :profile/id)
+        nm (get-or-null m :bot/name)
+        brief (get-or-null m :bot/brief)
+        cfg (get-or-null m :cli/config)]
+    (cond
+      (not (string=? (str-or sch "") (schema)))
+      (refusal :repo-profile/schema-mismatch
+               (cat3 ":profile/schema は \"cloud.itonami.app.repo-profile.v1\" である必要があります（"
+                     (document-edn-print sch) " でした）。"))
+
+      (blank-string? id)
+      (refusal :repo-profile/id-missing ":profile/id が必要です。")
+
+      (> (code-points (str-or id "")) (max-id))
+      (refusal :repo-profile/id-too-long ":profile/id が長すぎます（上限 120）。")
+
+      (and (document-contains m :bot/name) (blank-string? nm))
+      (refusal :repo-profile/name-blank ":bot/name が空です。")
+
+      (and (present? nm) (> (code-points (str-or nm "")) (max-name)))
+      (refusal :repo-profile/name-too-long ":bot/name が長すぎます（上限 60）。")
+
+      (and (present? brief) (> (text-length brief) (max-brief)))
+      (refusal :repo-profile/brief-too-long ":bot/brief が長すぎます（上限 2000）。")
+
+      (and (document-contains m :cli/config) (not (= :map (document-kind cfg))))
+      (refusal :repo-profile/cli-config-not-a-map ":cli/config は map である必要があります。")
+
+      :else
+      (let [extra (if (= :map (document-kind cfg)) (extra-cli-keys cfg 0 (document-vector)) (document-vector))]
+        (if (> (document-count extra) 0)
+          (refusal-with :repo-profile/cli-config-key-refused
+                        (cat3 ":cli/config にこの surface が読まない key があります: "
+                              (join-keywords extra 0 "")
+                              "。読むのは :skin だけです。")
+                        :refused-keys extra)
+          (document-null))))))
+
+(defn- select-keys-by [m :document which :i64 i :i64 acc :document] :document
+  ;; which: 0 describes, 1 prefers
+  (if (>= i (document-count m))
+    acc
+    (let [e (entry-at m i)
+          k (entry-key e)
+          keep? (if (= which 0) (describes? k) (prefers? k))]
+      (select-keys-by m which (+ i 1)
+                      (if keep? (document-assoc acc k (at-or-null e 1)) acc)))))
+
+;; Decide what `text` means: `{:accepted? true :profile/id … :describes …
+;; :prefers …}` or a refusal carrying `:reason` as a namespaced keyword, which
+;; callers pin rather than the message.
+(defn admit [text :string] :document
+  (if (> (string-length text) (max-bytes))
+    (refusal :repo-profile/too-large (cat3 (file-name) " が大きすぎます（上限 65536 bytes）。" ""))
+    (let [m (document-edn-read text)]
+      (if (not (= :map (document-kind m)))
+        (refusal :repo-profile/not-a-map (cat3 (file-name) " の中身が map ではありません。" ""))
+        (let [refused (refused-keys m 0 (document-vector))]
+          (if (> (document-count refused) 0)
+            (refusal-with :repo-profile/key-refused
+                          (cat3 (file-name) " に、repository が書いてはならない key があります: "
+                                (string-concat (join-keywords refused 0 "")
+                                               "。この file は記述であって授権ではありません。"))
+                          :refused-keys refused)
+            (let [bad (validate-values m)]
+              (if (present? bad)
+                bad
+                (document-assoc
+                 (document-assoc
+                  (document-assoc
+                   (document-assoc (document-assoc (document-map) :schema (document-string (schema)))
+                                   :accepted? (document-bool true))
+                   :profile/id (get-or-null m :profile/id))
+                  :describes (select-keys-by m 0 0 (document-map)))
+                 :prefers (select-keys-by m 1 0 (document-map)))))))))))
+
+;; One step of `admit-all`: fold `admit`'s answer for `text`, tagged with its
+;; `source`, into `{:accepted [...] :refused [...]}`. One bad file does not
+;; discard the good ones; the refusals are carried, not dropped. The host
+;; walks the pairs (and catches the reader's trap per file, handing
+;; `unreadable`'s answer to `admit-all-fold-result`).
+(defn- fold-result [acc :document source :string r :document] :document
+  (let [tagged (document-assoc r :source (document-string source))
+        key (if (refused? tagged) :refused :accepted)
+        bucket (let [b (get-or-null acc key)] (if (= :vector (document-kind b)) b (document-vector)))]
+    (document-assoc acc key (document-vector-conj bucket tagged))))
+
+(defn admit-all-fold [acc :document source :string text :string] :document
+  (fold-result acc source (admit text)))
+
+;; ---------------------------------------------------------------------------
+;; select — choose one of `accepted` for this operator, or refuse
+;; ---------------------------------------------------------------------------
+
+(defn- id-of [p :document] :string (str-or (get-or-null p :profile/id) ""))
+(defn- source-of [p :document] :string (str-or (get-or-null p :source) ""))
+(defn- for-of [p :document] :string
+  (str-or (get-or-null (get-or-null p :describes) :profile/for) ""))
+(defn- default-of? [p :document] :bool
+  (option-or (document-bool-value (get-or-null (get-or-null p :describes) :profile/default?)) false))
+
+;; the profiles matching `mode` (0 id = value, 1 for = value, 2 default?)
+(defn- matching [accepted :document mode :i64 value :string i :i64 acc :document] :document
+  (if (>= i (document-count accepted))
+    acc
+    (let [p (at-or-null accepted i)
+          hit (cond (= mode 0) (string=? (id-of p) value)
+                    (= mode 1) (string=? (for-of p) value)
+                    :else (default-of? p))]
+      (matching accepted mode value (+ i 1) (if hit (document-vector-conj acc p) acc)))))
+
+(defn- strings-of [ps :document field :i64 i :i64 acc :document] :document
+  ;; field 0 = :source, 1 = :profile/id
+  (if (>= i (document-count ps))
+    acc
+    (let [p (at-or-null ps i)]
+      (strings-of ps field (+ i 1)
+                  (document-vector-conj acc (document-string (if (= field 0) (source-of p) (id-of p))))))))
+
+(defn- join-sorted [v :document] :string
+  ;; sorted, space-joined
+  (let [sorted (document-vector-sort v)]
+    (loop [i 0 acc ""]
+      (if (>= i (document-count sorted))
+        acc
+        (recur (+ i 1) (if (= i 0) (str-or (at-or-null sorted i) "") (cat3 acc " " (str-or (at-or-null sorted i) ""))))))))
+
+(defn- pick-default [accepted :document] :document
+  (let [d (matching accepted 2 "" 0 (document-vector))]
+    (cond
+      (= 1 (document-count d)) (at-or-null d 0)
+      (> (document-count d) 1)
+      (refusal-with :repo-profile/duplicate-default
+                    (cat3 ":profile/default? true が複数あります: " (join-sorted (strings-of d 0 0 (document-vector))) "")
+                    :sources (strings-of d 0 0 (document-vector)))
+      (= 1 (document-count accepted)) (at-or-null accepted 0)
+      :else
+      (refusal-with :repo-profile/ambiguous
+                    (cat3 (string-concat "profile が " (string-from-i64 (document-count accepted)))
+                          " 本あり、どれを使うか決まりません。--profile <id> で指名するか、1 本に :profile/default? true を付けてください: "
+                          (join-sorted (strings-of accepted 1 0 (document-vector))))
+                    :available (strings-of accepted 1 0 (document-vector))))))
+
+;; `opts` is `{:requested <profile id> :as <local identity>}`. Precedence:
+;; 1. `:requested`, an exact `:profile/id`; 2. `:as` matching `:profile/for`;
+;; 3. the single `:profile/default? true`; 4. the single profile. Ambiguity
+;; REFUSES rather than choosing by filename.
+(defn select [accepted :document opts :document] :document
+  (let [requested (str-or (get-or-null opts :requested) "")
+        as (str-or (get-or-null opts :as) "")]
+    (cond
+      (= 0 (document-count accepted))
+      (refusal :repo-profile/none-accepted "この repository に読める profile がありません。")
+
+      (> (string-length requested) 0)
+      (let [m (matching accepted 0 requested 0 (document-vector))]
+        (cond
+          (= 1 (document-count m)) (at-or-null m 0)
+          (= 0 (document-count m))
+          (refusal-with :repo-profile/requested-not-found
+                        (cat3 requested " はこの repository にありません: " (join-sorted (strings-of accepted 1 0 (document-vector))))
+                        :available (strings-of accepted 1 0 (document-vector)))
+          :else
+          (refusal-with :repo-profile/duplicate-id
+                        (cat3 requested " が複数のファイルにあります: " (join-sorted (strings-of m 0 0 (document-vector))))
+                        :sources (strings-of m 0 0 (document-vector)))))
+
+      (> (string-length as) 0)
+      (let [m (matching accepted 1 as 0 (document-vector))]
+        (cond
+          (= 1 (document-count m)) (at-or-null m 0)
+          (> (document-count m) 1)
+          (refusal-with :repo-profile/duplicate-for
+                        (cat3 (cat3 "`" as "` 向けの profile が複数あります: ") (join-sorted (strings-of m 0 0 (document-vector))) "")
+                        :sources (strings-of m 0 0 (document-vector)))
+          ;; nobody claims this operator; fall through to the default
+          :else (pick-default accepted)))
+
+      :else (pick-default accepted))))
+
+;; ---------------------------------------------------------------------------
+;; tests
+;; ---------------------------------------------------------------------------
+
+(defn- reason-of [r :document] :keyword
+  (option-or (document-keyword-value (get-or-null r :reason)) :none))
+
+(defn- minimal [] :string
+  "{:profile/schema \"cloud.itonami.app.repo-profile.v1\" :profile/id \"jun\" :bot/name \"Jun\"}")
+
+(defn test-accepts [] :bool
+  (let [r (admit (minimal))]
+    (and (option-or (document-bool-value (get-or-null r :accepted?)) false)
+         (string=? (str-or (get-or-null r :profile/id) "") "jun")
+         (string=? (str-or (get-or-null (get-or-null r :describes) :bot/name) "") "Jun")
+         (= 0 (document-count (get-or-null r :prefers))))))
+
+(defn test-refuses-key [] :bool
+  (let [r (admit "{:profile/schema \"cloud.itonami.app.repo-profile.v1\" :profile/id \"jun\" :server {:port 1}}")]
+    (and (= :repo-profile/key-refused (reason-of r))
+         (= 1 (document-count (get-or-null r :refused-keys)))
+         (string-contains? (str-or (get-or-null r :message) "") ":server"))))
+
+(defn test-schema [] :bool
+  (= :repo-profile/schema-mismatch (reason-of (admit "{:profile/schema \"v0\" :profile/id \"jun\"}"))))
+
+(defn test-id-missing [] :bool
+  (and (= :repo-profile/id-missing (reason-of (admit "{:profile/schema \"cloud.itonami.app.repo-profile.v1\"}")))
+       (= :repo-profile/id-missing (reason-of (admit "{:profile/schema \"cloud.itonami.app.repo-profile.v1\" :profile/id \" \"}")))))
+
+(defn test-id-too-long [] :bool
+  (= :repo-profile/id-too-long
+     (reason-of (admit (cat3 "{:profile/schema \"cloud.itonami.app.repo-profile.v1\" :profile/id \""
+                             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                             "\"}")))))
+
+(defn test-name-blank [] :bool
+  (= :repo-profile/name-blank
+     (reason-of (admit "{:profile/schema \"cloud.itonami.app.repo-profile.v1\" :profile/id \"jun\" :bot/name \"\"}"))))
+
+(defn- repeat-doubling [unit :string n :i64] :string
+  ;; `unit` repeated at least n times, by doubling: 2^k concatenations, not n
+  (loop [acc unit len 1]
+    (if (>= len n) acc (recur (string-concat acc acc) (* len 2)))))
+
+(defn test-name-too-long [] :bool
+  ;; 64 code points of あ (3 bytes each) is over 60; 32 is under
+  (let [long (repeat-doubling "あ" 64)
+        short (repeat-doubling "あ" 32)
+        head "{:profile/schema \"cloud.itonami.app.repo-profile.v1\" :profile/id \"jun\" :bot/name \""]
+    (and (= :repo-profile/name-too-long (reason-of (admit (cat3 head long "\"}"))))
+         (option-or (document-bool-value (get-or-null (admit (cat3 head short "\"}")) :accepted?)) false))))
+
+(defn test-brief-too-long [] :bool
+  ;; 2048 code points of brief -> refused; 1024 -> fine
+  (let [head "{:profile/schema \"cloud.itonami.app.repo-profile.v1\" :profile/id \"jun\" :bot/brief \""]
+    (and (= :repo-profile/brief-too-long (reason-of (admit (cat3 head (repeat-doubling "b" 2048) "\"}"))))
+         (option-or (document-bool-value (get-or-null (admit (cat3 head (repeat-doubling "b" 1024) "\"}")) :accepted?)) false))))
+
+(defn test-cli-config [] :bool
+  (let [r (admit "{:profile/schema \"cloud.itonami.app.repo-profile.v1\" :profile/id \"jun\" :cli/config {:skin \"dark\"}}")]
+    (string=? "dark" (str-or (get-or-null (get-or-null (get-or-null r :prefers) :cli/config) :skin) ""))))
+
+(defn test-cli-config-key-refused [] :bool
+  (let [r (admit "{:profile/schema \"cloud.itonami.app.repo-profile.v1\" :profile/id \"jun\" :cli/config {:skin \"dark\" :server {}}}")]
+    (and (= :repo-profile/cli-config-key-refused (reason-of r))
+         (= 1 (document-count (get-or-null r :refused-keys))))))
+
+(defn test-not-a-map [] :bool
+  (= :repo-profile/not-a-map (reason-of (admit "[1 2 3]"))))
+
+(defn test-too-large [] :bool
+  ;; 65536 bytes is the host's typed-string bound AND max-bytes: a text of
+  ;; exactly that size is admitted (and then refused for what it says), one
+  ;; byte more never reaches this component -- the host traps
+  ;; `typed string is oversized` and hands it to `unreadable`, which is the
+  ;; only place `:repo-profile/too-large` can come from.
+  (let [edge (cat3 "{" (string-substring (repeat-doubling " " 65536) 0 65534) "}")]
+    (and (= 65536 (string-length edge))
+         (= :repo-profile/schema-mismatch (reason-of (admit edge)))
+         (= :repo-profile/too-large (reason-of (unreadable "typed string is oversized"))))))
+
+(defn test-unreadable [] :bool
+  (let [r (unreadable "document-edn-read unexpected end of input")]
+    (and (= :repo-profile/unreadable (reason-of r))
+         (string-contains? (str-or (get-or-null r :message) "") "unexpected end of input"))))
+
+(defn test-tagged [] :bool
+  (= :repo-profile/tagged-literal (reason-of (unreadable "document-edn-read dispatch forms are forbidden"))))
+
+(defn test-fold [] :bool
+  (let [acc (admit-all-fold (admit-all-fold (document-map) "a.edn" (minimal)) "b.edn" "{:x 1}")]
+    (and (= 1 (document-count (get-or-null acc :accepted)))
+         (= 1 (document-count (get-or-null acc :refused)))
+         (string=? "b.edn" (source-of (at-or-null (get-or-null acc :refused) 0))))))
+
+(defn- accepted-two [] :document
+  (document-vector-conj
+   (document-vector-conj (document-vector)
+                         (document {:accepted? true :profile/id "jun" :source "a.edn"
+                                    :describes {:profile/id "jun" :profile/for "jun"}}))
+   (document {:accepted? true :profile/id "bot" :source "b.edn"
+              :describes {:profile/id "bot" :profile/default? true}})))
+
+(defn test-select-requested [] :bool
+  (and (string=? "bot" (id-of (select (accepted-two) (document {:requested "bot"}))))
+       (= :repo-profile/requested-not-found (reason-of (select (accepted-two) (document {:requested "nope"}))))))
+
+(defn test-select-for [] :bool
+  (string=? "jun" (id-of (select (accepted-two) (document {:as "jun"})))))
+
+(defn test-select-default [] :bool
+  ;; nobody is `ken`; the default wins
+  (string=? "bot" (id-of (select (accepted-two) (document {:as "ken"})))))
+
+(defn test-select-single [] :bool
+  (let [one (document-vector-conj (document-vector) (document {:accepted? true :profile/id "solo" :describes {}}))]
+    (string=? "solo" (id-of (select one (document-map))))))
+
+(defn test-select-ambiguous [] :bool
+  (let [two (document-vector-conj
+             (document-vector-conj (document-vector) (document {:accepted? true :profile/id "a" :source "a" :describes {}}))
+             (document {:accepted? true :profile/id "b" :source "b" :describes {}}))
+        r (select two (document-map))]
+    (and (= :repo-profile/ambiguous (reason-of r))
+         (= 2 (document-count (get-or-null r :available))))))
+
+(defn test-select-none [] :bool
+  (= :repo-profile/none-accepted (reason-of (select (document-vector) (document-map)))))

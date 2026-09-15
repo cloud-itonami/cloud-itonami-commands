@@ -1,0 +1,72 @@
+[{:db/id -1
+  :adr/id "adr-2609151600-the-command-surface-is-kotoba"
+  :adr/title "The command surface is two Kotoba components, built by amu without a JVM; the Clojure stays as the oracle until the consumers cut over"
+  :adr/status "accepted"
+  :adr/date "2026-09-15"
+  :adr/related "adr-2609151200-the-contract-is-one-repository"
+  :adr/body "## What was asked
+
+JVM 依存なし、kotoba、amu native compiler のみ。
+
+## What was measured first (amu 73ddd26, 2026-09-15)
+
+Whole-component, not a decision core (kotoba-lang q9-migration.edn v3,
+`:decision-only-slices-allowed false`). The walls, each reproduced with a
+one-file probe before any code was written:
+
+- `[:list T]` cannot grow (`conj` refused by name), `map`/`filter` take
+  vector-i64 only, and the native-AOT target refuses every typed collection:
+  `[:list :string]`, `[:map :i64 :i64]`, `[:map :i64 :string]` all answer
+  \"typed values currently require the kotoba-script web target, typed Wasm
+  target, or qualified native string/scalar-record/option-i64/result-i64
+  features\". A scalar record compiles to aarch64 and runs.
+- `typed-map-keys` does not lower on wasm32; `string-index-of` is not
+  qualified there; `throw`/`try` lower on the KIR interpreter only.
+- The browser host admits 256 typed literals per module (300 string
+  literals in one module: `too many typed ABI literals`), a module's string
+  literals total 64 KiB, `case` desugars to nested `if`s and 211 clauses
+  exhaust the host stack, a function takes five parameters.
+- `string-length` is the UTF-8 byte count on every backend and
+  `string-code-point-at` refuses an offset inside a code point.
+- The compiled fuel budget (default 512) is per instance; a registry scan is
+  ~2,700 and `amu test` runs every test on one instance, so it cannot gate
+  this component.
+
+## Decision
+
+Two components, `cloud.itonami.commands` and `cloud.itonami.repo-profile`,
+as `.kotoba`, compiled `amu compile --jvm-free --target wasm32 --fuel 5000000`
+and shipped built under dist/ with amu's host beside them. Every dynamic
+value is a `:document`; the tables are chunks of eight commands, each one EDN
+string read at access time (27 + 5 + 1 literals); refusals are values with
+the oracle's `:type` and data; host effects are `{:needs …}` answered by the
+guest adapter; a command document is the projection a front end reads. The
+generated `commands.kotoba` is the `.in` with both tables spliced in, so the
+registry and the code that resolves it are one artifact.
+
+JVM-free is measured, not declared: `amu check`, `amu compile`, the build
+script, the fresh-instance test runner and the parity harness all run with a
+trapping `java`/`clojure`/`clj` stub on PATH and the trap never fires.
+deps.edn declares no org.clojure/clojure, no Maven coordinate, no JVM test
+runner.
+
+The Clojure oracles (`cloud.itonami.app.commands` / `.repo-profile`) stay,
+required by cloud-itonami-app (JVM) and app/mobile (ClojureScript) until
+those cut over. Parity: test/kotoba_parity_nbb.cljk, 588 checks over 26 argv
+cases, every registry command's usage and name, six searches, 22 profile
+texts and nine selections -- 0 failures; a perturbed oracle turns 2 of them
+red. It found two real disagreements on the way: the cljs oracle encoded `*`
+as %2A where URLEncoder does not (fixed in the oracle), and blank search terms.
+
+## Native AOT: blocked, by the compiler's own sentence
+
+The `aarch64-macos` target is `:blocked` for both components at the refusal
+quoted above. The gap to name in the language surface plan is typed
+collections (list / map) on native-aot. The components are not reduced to
+scalar predicates to make that target green.
+
+## What the consumer cutover looks like
+
+cloud-itonami-cli: require `cloud.itonami.commands.guest` and
+`cloud.itonami.repo-profile.guest` instead of the `.app.` namespaces, await
+`load!` before dispatch. Same names, same values, same throws."}]

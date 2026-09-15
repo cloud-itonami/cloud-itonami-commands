@@ -49,20 +49,64 @@ sha — no longer matches its routes. Adding a route is therefore:
 
 Step 3 is the step that used to be silent.
 
-## Tests
+## The components are Kotoba; the Clojure is the oracle
 
-```bash
-kbb -M:test      # 32 tests / 128 assertions on the kbb engine
+Since 2026-09-15 the two deciders are Kotoba components, compiled by amu
+(JVM-free) to wasm32 and shipped built:
+
+```
+src/cloud/itonami/commands.kotoba.in     the component, hand-written
+src/cloud/itonami/commands.kotoba        GENERATED: the .in with both tables spliced in
+src/cloud/itonami/repo_profile.kotoba    the profile component
+dist/commands.wasm, dist/repo_profile.wasm, dist/browser-host.mjs, dist/manifest.edn
+src/cloud/itonami/kotoba_host.cljk       the nbb host (mechanism only)
+src/cloud/itonami/commands/guest.cljk    `cloud.itonami.app.commands`, answered by the wasm
+src/cloud/itonami/repo_profile/guest.cljk
+src/cloud/itonami/app/*.cljk             the ORACLES, kept until every consumer has cut over
 ```
 
-`commands_tables_test` reads the shipped tables the way the terminal front
-end does (`install-sources!`, no classpath) and asks what a front end asks;
-`repo_profile_test` pins every refusal's `:reason` literal.
+A consumer on the kbb engine requires `cloud.itonami.commands.guest` instead
+of `cloud.itonami.app.commands` — same names, same values, same throws — and
+awaits `load!` once before dispatching. The wasm is instantiated once per
+process with a compiled-in fuel budget (5,000,000; a registry scan is ~2,700).
+
+```bash
+kbb --backend sci scripts/gen_commands_kotoba.cljk            # tables -> commands.kotoba (--check)
+AMU=…/kotoba-lang/amu/bin/amu kbb --backend sci scripts/build_kotoba.cljk   # -> dist/ (--check)
+kbb --backend sci --classpath src scripts/test_kotoba.cljk    # 39 test-* exports, one instance each
+kbb --backend sci --classpath "src:test" test/kotoba_parity_nbb.cljk   # 588 checks vs the oracles
+```
+
+`amu check --jvm-free` admits both components; `amu compile --jvm-free
+--target wasm32` builds them; no `java`, `clojure` or `clj` is invoked
+(verified with a trapping stub on PATH). The native-AOT target
+(`aarch64-macos`) refuses them today — "typed values currently require the
+kotoba-script web target, typed Wasm target, or qualified native
+string/scalar-record/option-i64/result-i64 features" — because a command is
+a document and argv is a sequence, neither of which native admits yet. That
+is a backend gap, recorded in ADR-2609151600, not a property of the code.
+
+Where the component could not say what the oracle said, the rule is written
+in the component's header and checked by the parity harness: a refusal is a
+value (`{:error …}`, re-thrown by the guest adapter as the oracle's
+`ex-info`), a host effect is a request (`{:needs …}`, answered by the
+adapter), and a command document is the projection a front end reads.
+
+## Tests of the oracles
+
+```bash
+kbb --backend sci --classpath "src:test" -e "(require 'cloud.itonami.app.repo-profile-test) (cljs.test/run-tests 'cloud.itonami.app.repo-profile-test)"
+kbb --backend sci --classpath "src:test" -e "(require 'cloud.itonami.app.commands-tables-test) (cljs.test/run-tests 'cloud.itonami.app.commands-tables-test)"
+```
+
+`commands_tables_test` reads the shipped tables the way the oracle front end
+did (`install-sources!`, no classpath); `repo_profile_test` pins every
+refusal's `:reason` literal. Both run on the kbb engine; no JVM.
 
 ## Consumers
 
 | consumer | how it depends | what it reads |
 |---|---|---|
-| cloud-itonami-cli `bin/itonami` | `nbb.edn` `:deps` git sha | both namespaces, all three tables (from the engine's classpath) |
+| cloud-itonami-cli `bin/itonami` | `nbb.edn` `:deps` git sha | the two wasm components through `cloud.itonami.commands.guest` / `.repo-profile.guest` |
 | cloud-itonami-app | `deps.edn` git sha | `commands` (cli.cljk, route_scan, commands-test), `defaults.edn` (config), `cli-aliases.edn` (tests) |
 | cloud-itonami-app/mobile | `mobile/deps.edn` git sha | `commands` + the two tables it inlines |

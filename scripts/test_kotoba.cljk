@@ -1,0 +1,55 @@
+#!/usr/bin/env kbb
+;; scripts/test_kotoba.cljk — run the `test-*` exports of the built artifacts
+;; (dist/*.wasm), each on a FRESH instance.
+;;
+;;   kbb --backend sci --classpath src scripts/test_kotoba.cljk
+;;
+;;   0  every test true      1  a test false or trapped      2  could not measure
+;;
+;; Why not `amu test`: it runs every test on one instance with the default
+;; 512-fuel budget (kotoba.compiler.test-profile, measured 2026-09-15), and a
+;; registry scan is ~2,700 fuel, so its wasm probe fails on the third test
+;; whatever the tests say. This runner is the same predicate over the same
+;; exports, on the artifact this repository ships, one instance per test.
+;; JVM-free: the host is dist/browser-host.mjs on Node.
+(ns test-kotoba
+  (:require [cloud.itonami.kotoba-host :as host]))
+
+(def artifacts ["commands.wasm" "repo_profile.wasm"])
+
+(defn- test-names [hosted]
+  (->> (js/Object.keys (.-exports (.-instance hosted)))
+       (filter #(.startsWith % "test-"))
+       vec))
+
+(defn- run-one! [artifact name]
+  (-> (host/load! artifact)
+      (.then (fn [hosted]
+               (try (let [v ((aget (.-exports (.-instance hosted)) name))]
+                      {:artifact artifact :test name :ok (true? v) :value v})
+                    (catch :default e
+                      {:artifact artifact :test name :ok false :error (str (or (some-> e .-message) e))}))))))
+
+(defn- run-all! [artifact]
+  (-> (host/load! artifact)
+      (.then (fn [hosted]
+               (let [names (test-names hosted)]
+                 (when (empty? names)
+                   (throw (ex-info (str "no test-* exports in " artifact) {:artifact artifact})))
+                 (reduce (fn [p name] (.then p (fn [acc] (.then (run-one! artifact name) #(conj acc %)))))
+                         (js/Promise.resolve [])
+                         names))))))
+
+(-> (reduce (fn [p a] (.then p (fn [acc] (.then (run-all! a) #(into acc %)))))
+            (js/Promise.resolve [])
+            artifacts)
+    (.then (fn [results]
+             (let [failed (remove :ok results)]
+               (doseq [r failed] (println " FAIL" (:artifact r) (:test r) (or (:error r) (pr-str (:value r)))))
+               (println (str "kotoba test: " (- (count results) (count failed)) "/" (count results)
+                             (if (empty? failed) " passed" " FAILED")
+                             " artifacts=" (pr-str artifacts)))
+               (js/process.exit (if (empty? failed) 0 1)))))
+    (.catch (fn [e]
+              (println "CANNOT MEASURE:" (ex-message e) (pr-str (ex-data e)))
+              (js/process.exit 2))))
