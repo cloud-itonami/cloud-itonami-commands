@@ -27,14 +27,21 @@
             [clojure.edn :as edn]
             [nbb.core :refer [*file*]]))
 
-;; In this repository the artifacts are under dist/; on a consumer's
-;; classpath (nbb.edn :deps, `:paths ["src" "resources" "dist"]`) the same
-;; files sit at the classpath root beside `cloud/`. Both are `../../..` from
-;; this file; the first that carries a manifest wins.
+;; In this repository this file is src/cloud/itonami/ and the artifacts are
+;; <repo>/dist/. On a consumer's classpath (nbb.edn :deps with `:paths
+;; ["src" "resources" "dist"]`, extracted by the engine) there is no `src`
+;; level: this file is <root>/cloud/itonami/ and the artifacts sit at
+;; <root>/ beside `cloud/`. The first candidate carrying a manifest wins;
+;; none is a refusal by name, not a guess.
 (def dist-dir
-  (let [root (path/resolve (path/dirname *file*) ".." ".." "..")
-        nested (path/join root "dist")]
-    (if (fs/existsSync (path/join nested "manifest.edn")) nested root)))
+  (let [here (path/dirname *file*)
+        candidates [(path/resolve here ".." ".." ".." "dist")
+                    (path/resolve here ".." "..")
+                    (path/resolve here ".." ".." "..")]]
+    (or (some (fn [d] (when (fs/existsSync (path/join d "manifest.edn")) d)) candidates)
+        (throw (ex-info (str "kotoba dist/ not found beside " here
+                             " (run scripts/build_kotoba.cljk, or put dist on the classpath)")
+                        {:type :kotoba-host/dist-missing :candidates candidates})))))
 
 (defonce ^:private host-module (atom nil))
 (defonce ^:private instances (atom {}))
