@@ -1,0 +1,49 @@
+[{:db/id -1
+  :adr/id "adr-2609151200-the-contract-is-one-repository"
+  :adr/title "The command surface is one repository every front end pins, not a copy with a checker"
+  :adr/status "accepted"
+  :adr/date "2026-09-15"
+  :adr/related "adr-2609075600-the-cli-leaves-the-app"
+  :adr/body "## What was asked
+
+itonami cli を実行するとエラー。cloud-itonami-cli を確認して、また cloud-itonami-* で
+共通化できる部分は共通化 repo を作って共通化して。
+
+## What was measured
+
+`cloud.itonami.app.commands`, `cloud.itonami.app.repo-profile` and the tables
+they read existed in two checkouts (app, cli) and were reached from a third
+(app/mobile via `:extra-paths [\"../src\" \"../resources\"]`). The CLI's copy
+was pinned with a drift checker (adr-2609075600). On 2026-09-15 that checker
+said DRIFT on three of four files: commands.edn 409 -> 414 routes, cli-aliases
++18 lines, defaults.edn rewritten. The checker worked; nobody ran it.
+
+The 2026-09-07 split ADR wrote: \"the registry is the contract between them,
+and until today that contract was implicit in a shared directory. Now it is
+three files with a digest and a checker that refuses to guess.\" A contract
+that each party keeps its own copy of is the shared directory again, with a
+digest.
+
+## Decision
+
+One repository, `cloud-itonami/cloud-itonami-commands`, carrying the two
+deciders and the three tables. Every consumer depends on it by git sha:
+the CLI through `nbb.edn` (the file the engine reads), the app and mobile
+through `deps.edn`. The app's generator writes into this repository's
+checkout; the app's `commands-test` compares its routes with the table on
+its classpath, i.e. at the pinned sha, so a new route fails the app's suite
+until this repository is regenerated AND the app's pin advanced. That is
+the ordinary dependency dance and it is visible in every step.
+
+Namespace names are unchanged so no `require` moves.
+
+## What this is not
+
+Not the shared code between the ~1,400 taxonomy repositories
+(`cloud-itonami-iso3166-*` marketentry x186, `cloud-itonami-lei-*`
+tosmonitor x51, `schema/culture.edn` x245, measured the same day by content
+hash). Those are byte-identical scaffold copies and a separate decision:
+they describe themselves as standalone forkable businesses, and their
+`:local/root` deps already point at kotoba-lang libraries for the parts
+that were extracted before (langchain-store, marketplace). Recorded in the
+root ADR of the same id; not acted on here."}]

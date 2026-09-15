@@ -1,0 +1,57 @@
+(ns cloud.itonami.app.commands-tables-test
+  "The three tables this repository ships, read through the one decider.
+
+  This host has no classpath resources, so the test hands the table TEXT to
+  `install-sources!` exactly as the terminal front end does, and then asks
+  the questions a front end asks: is the registry the schema the app
+  generates, does it carry more than the seventeen commands that started
+  this (see the `commands` namespace docstring), does an alias shadow a
+  generated command, does an unknown name come back as `:unknown` and not as
+  something else.
+
+  The tables are loaded once per process (`delay`), so the refusal case is
+  exercised on the decider's own boundary -- a name that no table carries --
+  rather than by swapping tables underneath a realised delay."
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            [clojure.edn :as edn]
+            [clojure.test :refer [deftest is testing]]
+            [cloud.itonami.app.commands :as commands]))
+
+(def ^:private here (path/resolve "resources"))
+
+(defn- table [n] (fs/readFileSync (path/join here n) "utf8"))
+
+(commands/install-sources!
+ {commands/resource-name (table commands/resource-name)
+  commands/alias-resource-name (table commands/alias-resource-name)})
+
+(deftest the-shipped-registry-is-the-generated-schema
+  (let [raw (edn/read-string (table commands/resource-name))]
+    (testing "the file the app's generator wrote, not a hand-made list"
+      (is (= "cloud.itonami.app.commands.v1" (:schema raw)))
+      (is (every? #(contains? raw %) [:commands :counts])))
+    (testing "coverage is a number, and not the seventeen this started from"
+      (is (< 17 (count (commands/all))))
+      (is (= (count (commands/all)) (count (:commands raw))))
+      (is (pos? (get-in raw [:counts :human-only]))
+          "human-only routes are counted rather than hidden"))))
+
+(deftest an-alias-shadows-a-generated-command-of-the-same-name
+  (let [r (commands/resolve-invocation ["business" "list"])]
+    (is (= :alias (:kind r)) (pr-str r))))
+
+(deftest a-registry-command-resolves-with-its-rest
+  (let [r (commands/resolve-invocation ["bots" "list"])]
+    (is (contains? #{:alias :registry} (:kind r)) (pr-str r))
+    (is (= ["bots" "list"] (:words r)))))
+
+(deftest boundary-a-name-no-table-carries-is-unknown-not-an-error
+  (let [r (commands/resolve-invocation ["no" "such" "command" "20260915"])]
+    (is (= :unknown (:kind r)) (pr-str r))))
+
+(deftest defaults-name-where-the-server-answers
+  (let [d (edn/read-string (table "cloud-itonami-app.defaults.edn"))]
+    (is (map? d))
+    (is (string? (get-in d [:server :host])))
+    (is (pos-int? (get-in d [:server :port])))))

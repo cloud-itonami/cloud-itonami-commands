@@ -1,0 +1,5 @@
+# The engine's dependency cache for nbb.edn :deps (a cold cache needs `bb`
+# once; measured in cloud-itonami-cli 2026-09-15).
+.nbb/
+.cpcache/
+target/

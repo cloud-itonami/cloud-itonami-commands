@@ -1,0 +1,9 @@
+{:format :kotoba.cljk-origin/v1
+ :renamed-on "2026-09-15"
+ :decision "adr-2609111500-cljk-rename-all-clojure-source (com-junkawasaki/root 90-docs/adr). These files arrived already renamed, from cloud-itonami-app's own cljk-origin.edn; the values are that record's."
+ :rule "value = the extension the file had before the 2026-09-11 rename."
+ :origins
+ {"src/cloud/itonami/app/commands.cljk" ".cljc"
+  "src/cloud/itonami/app/repo_profile.cljk" ".cljc"
+  "test/cloud/itonami/app/repo_profile_test.cljk" ".clj"
+  "test/cloud/itonami/app/commands_tables_test.cljk" ".cljc"}}
