@@ -6,12 +6,12 @@
 ;;
 ;;   0  every test true      1  a test false or trapped      2  could not measure
 ;;
-;; Why not `amu test`: it runs every test on one instance with the default
-;; 512-fuel budget (kotoba.compiler.test-profile, measured 2026-09-15), and a
-;; registry scan is ~2,700 fuel, so its wasm probe fails on the third test
-;; whatever the tests say. This runner is the same predicate over the same
-;; exports, on the artifact this repository ships, one instance per test.
-;; JVM-free: the host is dist/browser-host.mjs on Node.
+;; `amu test <file> --fuel 5000000` runs the same exports on the interpreter,
+;; js and wasm probes (amu ADR 0349, 2026-09-15: before it, every test shared
+;; one 512-fuel instance and the wasm probe failed on the third test). This
+;; runner is the same predicate over the same exports on the ARTIFACT this
+;; repository ships -- dist/*.wasm under dist/browser-host.mjs, the bytes a
+;; consumer runs -- one instance per test. JVM-free: Node only.
 (ns test-kotoba
   (:require [cloud.itonami.kotoba-host :as host]))
 
