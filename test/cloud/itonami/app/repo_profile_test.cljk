@@ -6,7 +6,7 @@
   it meant to exercise — ADR-2608136000 §6, and the reason this file is mostly
   reasons."
   (:require [kotoba.lang.text :as str]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [cloud.itonami.app.repo-profile :as rp]))
 
 (def ^:private minimal
