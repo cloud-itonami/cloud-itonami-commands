@@ -24,7 +24,7 @@
 ;;   - the oracle throws where the guest returns `{:error …}`; the guest
 ;;     adapter re-throws, so both sides are caught the same way here.
 (ns kotoba-parity-nbb
-  (:require [clojure.set :as set]
+  (:require [kotoba.lang.coll :as set]
             [cloud.itonami.app.commands :as oracle]
             [cloud.itonami.app.repo-profile :as oracle-rp]
             [cloud.itonami.commands.guest :as guest]
