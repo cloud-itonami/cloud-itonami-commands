@@ -53,8 +53,8 @@
   `:flags` are the keys the route was seen to read. They are hints for help
   output, NOT a schema — unknown flags are passed through, because a schema this
   cannot verify would refuse calls the server would have accepted."
-  (:require [clojure.edn :as edn]
-            #?(:clj [clojure.java.io :as io])
+  (:require [kotoba.http.form-urlencoded :as form-urlencoded] [clojure.edn :as edn]
+            #?(:clj [kotoba.io :as io])
             [kotoba.lang.text :as str]))
 
 (def resource-name "cloud-itonami-app.commands.edn")
@@ -114,7 +114,7 @@
     ;; 2026-09-15 the cljs branch encoded it as %2A -- the one character on
     ;; which the two runtimes disagreed (found by the Kotoba parity corpus,
     ;; test/kotoba_parity_nbb.cljk).
-    #?(:clj (java.net.URLEncoder/encode s "UTF-8")
+    #?(:clj (form-urlencoded/form-encode s)
        :cljs (-> (js/encodeURIComponent s)
                  (str/replace "%20" "+")
                  (str/replace "!" "%21")
