@@ -257,7 +257,7 @@
                            ;; measured those windows through api.murakumo.cloud,
                            ;; so bots budget a conservative 128k — an unmeasured
                            ;; number that looks like a measured one is the
-                           ;; defect class CLAUDE.md names.
+                           ;; defect class AGENTS.md names.
                            "z-ai/glm-5.3-flash" 128000
                            "qwen/qwen3.8-flash" 128000}
    ;; 2026-09-09 owner: use the serving route maximum, not the demo cap.
