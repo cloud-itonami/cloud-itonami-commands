@@ -1,0 +1,41 @@
+[{:db/id -1
+  :adr/id "adr-2611050900-cheaper-inference-is-a-provider-default-not-a-reviewed-egress"
+  :adr/title "Cheaper Inference is a catalogued provider default, not a reviewed egress"
+  :adr/status "accepted"
+  :adr/date "2026-11-05"
+  :adr/related "adr-2609180515-io-intelligence-is-a-provider-default-not-a-reviewed-egress"
+  :adr/body "## What was asked
+
+Add Cheaper Inference to the provider defaults.
+
+## What was measured
+
+Cheaper Inference serves an OpenAI-compatible chat completions endpoint:
+POST {base-url}/chat/completions and GET {base-url}/models, Bearer
+auth from an env var the record names. Model ids are bare
+(`gpt-5.4-mini`), with no org/ prefix. Its public model list
+(GET https://api.cheaperinference.com/public/models, 2026-11-05) lists
+`gpt-5.4-mini` as a text model with `context_length` 400000 and the
+`tool-use` feature. The record carries that number, because
+`model-context-window` prefers the catalog entry over live discovery.
+The record was not exercised against a live key in this change.
+
+## Decision
+
+One record, id `cheaper-inference`, kind `:openai-compatible`, base URL
+`https://api.cheaperinference.com/v1`, credential env
+`CHEAPER_INFERENCE_API_KEY`, default model `gpt-5.4-mini` with the
+listed 400000 window. It ships `:reviewed? false` and `:enabled? false`,
+the same terms as every other destination that leaves the machine:
+nothing changes for an existing install until an operator overlays the
+record by id in `data/config.edn` and turns the deployment's
+`:routing :cloud-enabled?` on. No other surface moves: the Bot picker
+renders `provider.name`, and the app's `.env.example` stays as it was
+for the ionet addition.
+
+## What this is not
+
+Not a review of Cheaper Inference. `:reviewed?` is operator-asserted
+trust, and a catalog record cannot express per-provider request
+options. Consumers advance their pins to pick the record up; a stale
+pin is the ordinary dependency state."}]

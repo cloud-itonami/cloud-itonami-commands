@@ -76,3 +76,18 @@
     (is (false? (:enabled? ionet)))
     (is (false? (:reviewed? ionet)))
     (is (not (contains? ionet :api-key)))))
+
+(deftest cheaper-inference-ships-as-an-explicitly-reviewed-opt-in
+  (let [ci (some #(when (= "cheaper-inference" (:id %)) %)
+                 (:providers (edn/read-string (table "cloud-itonami-app.defaults.edn"))))]
+    (is (some? ci) "the cheaper-inference record is in the shipped catalog")
+    (is (= :openai-compatible (:kind ci)))
+    (is (= "Cheaper Inference" (:name ci)))
+    (is (= "https://api.cheaperinference.com/v1" (:base-url ci)))
+    (is (= "CHEAPER_INFERENCE_API_KEY" (:api-key-env ci)))
+    (is (= "gpt-5.4-mini" (:default-model ci)))
+    (is (= 400000 (get-in ci [:context-window-tokens "gpt-5.4-mini"])))
+    (is (false? (:local? ci)))
+    (is (false? (:enabled? ci)))
+    (is (false? (:reviewed? ci)))
+    (is (not (contains? ci :api-key)))))
